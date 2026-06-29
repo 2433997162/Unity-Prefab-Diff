@@ -1,0 +1,1002 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prefab Diff</title>
+<style>
+:root {
+    --bg: #eef4f8;
+    --panel: #ffffff;
+    --panel-soft: #f7fafc;
+    --line: #cfd9e3;
+    --line-soft: #e6edf3;
+    --text: #1e293b;
+    --muted: #6b7a8d;
+    --accent: #2386b8;
+    --accent-soft: #d7ecf6;
+    --added: #18834a;
+    --added-bg: #e5f6eb;
+    --removed: #bf3c3c;
+    --removed-bg: #fdeaea;
+    --modified: #a66b00;
+    --modified-bg: #fff1d6;
+    --shadow: 0 10px 24px rgba(24, 39, 58, 0.08);
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.45 "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+}
+
+button,
+input {
+    font: inherit;
+}
+
+.app {
+    min-height: 100vh;
+    padding: 18px;
+}
+
+.mode-embed .app {
+    padding: 0;
+    min-height: 100vh;
+}
+
+.page-header {
+    margin: 0 0 12px;
+    padding: 14px 18px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+    box-shadow: var(--shadow);
+}
+
+.mode-embed .page-header {
+    display: none;
+}
+
+.page-title {
+    margin: 0 0 8px;
+    font-size: 20px;
+    font-weight: 650;
+}
+
+.meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.report-section {
+    margin: 0 0 14px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+}
+
+.mode-embed .report-section {
+    height: 100vh;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+}
+
+.report-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line-soft);
+    background: #fbfdff;
+}
+
+.mode-embed .report-header {
+    display: none;
+}
+
+.report-title {
+    min-width: 0;
+    font-size: 16px;
+    font-weight: 650;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 22px;
+    padding: 1px 8px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    color: var(--muted);
+    background: #fff;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.badge.added {
+    color: var(--added);
+    border-color: #9bd2af;
+    background: var(--added-bg);
+}
+
+.badge.removed {
+    color: var(--removed);
+    border-color: #e5a6a6;
+    background: var(--removed-bg);
+}
+
+.badge.modified {
+    color: var(--modified);
+    border-color: #e7c478;
+    background: var(--modified-bg);
+}
+
+.diff-panel {
+    display: grid;
+    grid-template-columns: minmax(260px, 37%) 6px minmax(360px, 1fr);
+    height: min(72vh, 760px);
+    min-height: 520px;
+    background: var(--panel);
+}
+
+.mode-embed .diff-panel {
+    height: 100vh;
+    min-height: 0;
+}
+
+.hierarchy,
+.inspector {
+    min-width: 0;
+    min-height: 0;
+}
+
+.hierarchy {
+    display: flex;
+    flex-direction: column;
+    background: var(--panel-soft);
+}
+
+.inspector {
+    display: flex;
+    flex-direction: column;
+    background: var(--panel);
+}
+
+.panel-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 36px;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--line);
+    color: var(--muted);
+    background: #f4f8fb;
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+}
+
+.filter-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 400;
+    letter-spacing: 0;
+    text-transform: none;
+}
+
+.tree-wrap,
+.inspector-scroll {
+    min-height: 0;
+    overflow: auto;
+}
+
+.tree-wrap {
+    flex: 1;
+    padding: 4px 0 10px;
+}
+
+.tree-row {
+    display: grid;
+    grid-template-columns: 18px 16px minmax(0, 1fr);
+    align-items: center;
+    min-height: 26px;
+    padding-right: 10px;
+    color: var(--muted);
+    cursor: default;
+    user-select: none;
+}
+
+.tree-row:hover {
+    background: #eaf3f8;
+}
+
+.tree-row.active {
+    color: var(--text);
+    background: var(--accent-soft);
+    box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.tree-row.changed {
+    color: var(--text);
+}
+
+.tree-row.added .tree-name,
+.tree-row.added .tree-mark {
+    color: var(--added);
+}
+
+.tree-row.removed .tree-name,
+.tree-row.removed .tree-mark {
+    color: var(--removed);
+    text-decoration: line-through;
+}
+
+.tree-row.modified .tree-name,
+.tree-row.modified .tree-mark {
+    color: var(--modified);
+}
+
+.tree-toggle {
+    width: 18px;
+    height: 22px;
+    border: 0;
+    color: #657488;
+    background: transparent;
+    padding: 0;
+    cursor: pointer;
+}
+
+.tree-toggle.placeholder {
+    cursor: default;
+}
+
+.tree-mark {
+    text-align: center;
+    font-weight: 700;
+}
+
+.tree-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.splitter {
+    border-left: 1px solid var(--line);
+    border-right: 1px solid var(--line);
+    background: #dce6ee;
+    cursor: col-resize;
+}
+
+.splitter:hover,
+.splitter.dragging {
+    background: #9cc8dc;
+}
+
+.node-summary {
+    padding: 16px 18px 12px;
+    border-bottom: 1px solid var(--line-soft);
+}
+
+.node-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.node-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 18px;
+    font-weight: 700;
+}
+
+.node-path {
+    margin-top: 5px;
+    color: var(--muted);
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.status-pill {
+    display: inline-flex;
+    align-items: center;
+    min-height: 20px;
+    padding: 1px 7px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.status-pill.added {
+    color: var(--added);
+    border-color: #9bd2af;
+    background: var(--added-bg);
+}
+
+.status-pill.removed {
+    color: var(--removed);
+    border-color: #e5a6a6;
+    background: var(--removed-bg);
+}
+
+.status-pill.modified {
+    color: var(--modified);
+    border-color: #e7c478;
+    background: var(--modified-bg);
+}
+
+.inspector-scroll {
+    flex: 1;
+    padding: 12px 18px 18px;
+}
+
+.component {
+    margin: 0 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    overflow: hidden;
+    background: #fff;
+}
+
+.component-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+    min-height: 34px;
+    padding: 0 12px;
+    border: 0;
+    border-bottom: 1px solid var(--line-soft);
+    color: var(--text);
+    background: #f8fbfd;
+    cursor: pointer;
+    text-align: left;
+}
+
+.component-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    font-weight: 650;
+}
+
+.component-title span:last-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.component-count {
+    color: var(--muted);
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.component-body {
+    display: block;
+}
+
+.component.collapsed .component-body {
+    display: none;
+}
+
+.prop-row {
+    display: grid;
+    grid-template-columns: minmax(130px, 24%) minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+    min-height: 34px;
+    padding: 7px 12px;
+    border-top: 1px solid var(--line-soft);
+}
+
+.prop-row:first-child {
+    border-top: 0;
+}
+
+.prop-row.added {
+    box-shadow: inset 3px 0 0 var(--added);
+}
+
+.prop-row.removed {
+    box-shadow: inset 3px 0 0 var(--removed);
+}
+
+.prop-row.modified {
+    box-shadow: inset 3px 0 0 var(--modified);
+}
+
+.prop-name {
+    color: var(--muted);
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 12px;
+    word-break: break-word;
+}
+
+.prop-values {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr);
+    gap: 8px;
+    align-items: center;
+    min-width: 0;
+}
+
+.prop-values.single {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+.value {
+    display: inline-block;
+    max-width: 100%;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.value.added {
+    color: var(--added);
+    background: var(--added-bg);
+}
+
+.value.removed {
+    color: var(--removed);
+    background: var(--removed-bg);
+}
+
+.value.modified {
+    color: var(--modified);
+    background: var(--modified-bg);
+}
+
+.arrow {
+    color: var(--muted);
+    text-align: center;
+}
+
+.empty {
+    margin: 18px;
+    padding: 24px;
+    border: 1px dashed var(--line);
+    border-radius: 8px;
+    color: var(--muted);
+    background: #fbfdff;
+    text-align: center;
+}
+
+@media (max-width: 760px) {
+    .app { padding: 8px; }
+    .diff-panel {
+        display: flex;
+        flex-direction: column;
+        height: auto;
+        min-height: 0;
+    }
+    .hierarchy { min-height: 320px; }
+    .splitter { display: none; }
+    .inspector { min-height: 380px; }
+    .prop-row {
+        grid-template-columns: 1fr;
+        gap: 5px;
+    }
+}
+</style>
+</head>
+<body>
+<div id="app" class="app"></div>
+<script id="prefab-diff-data" type="application/json">__PREFAB_DIFF_DATA__</script>
+<script>
+(() => {
+    "use strict";
+
+    const dataNode = document.getElementById("prefab-diff-data");
+    const reportData = JSON.parse(dataNode.textContent || "{}");
+    const app = document.getElementById("app");
+    const statusText = {
+        added: "Added",
+        removed: "Removed",
+        modified: "Modified",
+        unchanged: "Unchanged"
+    };
+    const statusMark = {
+        added: "+",
+        removed: "-",
+        modified: "*",
+        unchanged: "o"
+    };
+
+    document.title = reportData.title || "Prefab Diff";
+    document.body.classList.add(reportData.reportMode === "embed" ? "mode-embed" : "mode-full");
+
+    function el(tag, className, text) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined && text !== null) node.textContent = text;
+        return node;
+    }
+
+    function setTitle(node, text) {
+        node.title = text || "";
+        return node;
+    }
+
+    function asArray(value) {
+        return Array.isArray(value) ? value : [];
+    }
+
+    function basename(path) {
+        if (!path) return "(root)";
+        const parts = path.split("/").filter(Boolean);
+        return parts.length ? parts[parts.length - 1] : path;
+    }
+
+    function splitPath(path) {
+        return path ? path.split("/").filter(Boolean) : ["(root)"];
+    }
+
+    function getCounts(report) {
+        const counts = report.counts || {};
+        return {
+            addedNodes: counts.addedNodes || asArray(report.added).length,
+            removedNodes: counts.removedNodes || asArray(report.removed).length,
+            modifiedNodes: counts.modifiedNodes || asArray(report.modified).length,
+            changedProperties: counts.changedProperties || 0
+        };
+    }
+
+    function renderBadge(text, type) {
+        return el("span", type ? `badge ${type}` : "badge", text);
+    }
+
+    function renderStatus(status) {
+        return el("span", `status-pill ${status}`, statusText[status] || status);
+    }
+
+    function buildChangeMap(report) {
+        const map = new Map();
+        asArray(report.added).forEach(item => {
+            map.set(item.path, { status: "added", props: asArray(item.props), item });
+        });
+        asArray(report.removed).forEach(item => {
+            map.set(item.path, { status: "removed", props: asArray(item.props), item });
+        });
+        asArray(report.modified).forEach(item => {
+            map.set(item.path, {
+                status: "modified",
+                added: asArray(item.added),
+                removed: asArray(item.removed),
+                changed: asArray(item.changed),
+                item
+            });
+        });
+        return map;
+    }
+
+    function collectPaths(report, changeMap) {
+        const seen = new Set();
+        const paths = [];
+        const add = path => {
+            if (!path || seen.has(path)) return;
+            seen.add(path);
+            paths.push(path);
+        };
+        asArray(report.newPaths).forEach(add);
+        asArray(report.oldPaths).forEach(add);
+        changeMap.forEach((_, path) => add(path));
+        return paths;
+    }
+
+    function createTreeNode(name, path) {
+        return {
+            name,
+            path,
+            children: new Map(),
+            status: "unchanged",
+            hasSelfChange: false,
+            hasAnyChange: false,
+            expanded: true
+        };
+    }
+
+    function buildTree(report, changeMap) {
+        const root = createTreeNode("(root)", "");
+        collectPaths(report, changeMap).forEach(path => {
+            const parts = splitPath(path);
+            let parent = root;
+            let currentPath = "";
+            parts.forEach(part => {
+                currentPath = currentPath ? `${currentPath}/${part}` : part;
+                if (!parent.children.has(part)) {
+                    parent.children.set(part, createTreeNode(part, currentPath));
+                }
+                parent = parent.children.get(part);
+            });
+            const change = changeMap.get(path);
+            if (change) {
+                parent.status = change.status;
+                parent.hasSelfChange = true;
+            }
+        });
+        markTree(root);
+        return root;
+    }
+
+    function markTree(node) {
+        let hasChange = node.hasSelfChange;
+        node.children.forEach(child => {
+            if (markTree(child)) hasChange = true;
+        });
+        node.hasAnyChange = hasChange;
+        return hasChange;
+    }
+
+    function firstChangedPath(report) {
+        const modified = asArray(report.modified);
+        const added = asArray(report.added);
+        const removed = asArray(report.removed);
+        if (modified.length) return modified[0].path;
+        if (added.length) return added[0].path;
+        if (removed.length) return removed[0].path;
+        return asArray(report.newPaths)[0] || asArray(report.oldPaths)[0] || "";
+    }
+
+    function renderApp() {
+        const reports = asArray(reportData.reports);
+        if (reportData.reportMode !== "embed") {
+            app.appendChild(renderPageHeader(reports));
+        }
+        if (!reports.length) {
+            app.appendChild(el("div", "empty", "未找到 Prefab/Scene 变更。"));
+            return;
+        }
+        reports.forEach(report => app.appendChild(renderReport(report)));
+    }
+
+    function renderPageHeader(reports) {
+        const header = el("header", "page-header");
+        const title = el("h1", "page-title", (reportData.summary && reportData.summary.title) || "Prefab 变更报告");
+        header.appendChild(title);
+        const meta = el("div", "meta");
+        const label = reportData.summary && reportData.summary.label;
+        if (label) meta.appendChild(el("span", "", label));
+        meta.appendChild(el("span", "", reportData.generatedAt || ""));
+        meta.appendChild(el("span", "", `${reports.length} 个文件`));
+        header.appendChild(meta);
+        return header;
+    }
+
+    function renderReport(report) {
+        const section = el("section", "report-section");
+        const changeMap = buildChangeMap(report);
+        section.__changeMap = changeMap;
+        section.__report = report;
+
+        section.appendChild(renderReportHeader(report));
+
+        const panel = el("div", "diff-panel");
+        const hierarchy = el("aside", "hierarchy");
+        const splitter = el("div", "splitter");
+        const inspector = el("main", "inspector");
+
+        hierarchy.appendChild(renderHierarchy(report, changeMap, section));
+        inspector.appendChild(renderInspectorShell());
+
+        panel.appendChild(hierarchy);
+        panel.appendChild(splitter);
+        panel.appendChild(inspector);
+        section.appendChild(panel);
+
+        initResizer(panel, splitter);
+        const initial = firstChangedPath(report);
+        if (initial) {
+            requestAnimationFrame(() => selectPath(section, initial));
+        } else {
+            section.querySelector(".inspector-scroll").appendChild(
+                el("div", "empty", "当前文件没有解析到可展示的节点变更。")
+            );
+        }
+        return section;
+    }
+
+    function renderReportHeader(report) {
+        const header = el("div", "report-header");
+        header.appendChild(setTitle(el("div", "report-title", report.filename || "prefab"), report.filename || ""));
+        const counts = getCounts(report);
+        const badges = el("div", "badges");
+        badges.appendChild(renderBadge(`+${counts.addedNodes} 节点`, "added"));
+        badges.appendChild(renderBadge(`-${counts.removedNodes} 节点`, "removed"));
+        badges.appendChild(renderBadge(`${counts.changedProperties} 属性变更`, "modified"));
+        header.appendChild(badges);
+        return header;
+    }
+
+    function renderHierarchy(report, changeMap, section) {
+        const fragment = document.createDocumentFragment();
+        const toolbar = el("div", "panel-toolbar");
+        toolbar.appendChild(el("span", "", "Hierarchy"));
+        const label = el("label", "filter-label");
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = true;
+        label.appendChild(checkbox);
+        label.appendChild(document.createTextNode("仅变更"));
+        toolbar.appendChild(label);
+        fragment.appendChild(toolbar);
+
+        const wrap = el("div", "tree-wrap");
+        fragment.appendChild(wrap);
+
+        const tree = buildTree(report, changeMap);
+        const render = () => {
+            wrap.textContent = "";
+            renderTreeChildren(tree, wrap, section, checkbox.checked, 0);
+        };
+        checkbox.addEventListener("change", render);
+        section.__renderTree = render;
+        render();
+        return fragment;
+    }
+
+    function renderTreeChildren(node, container, section, changedOnly, depth) {
+        node.children.forEach(child => {
+            if (changedOnly && !child.hasAnyChange) return;
+            renderTreeRow(child, container, section, changedOnly, depth);
+            if (child.expanded) {
+                renderTreeChildren(child, container, section, changedOnly, depth + 1);
+            }
+        });
+    }
+
+    function renderTreeRow(node, container, section, changedOnly, depth) {
+        const row = el("div", `tree-row ${node.status} ${node.hasSelfChange ? "changed" : ""}`);
+        row.dataset.path = node.path;
+        row.style.paddingLeft = `${Math.min(depth * 18, 260) + 4}px`;
+
+        const hasChildren = node.children.size > 0;
+        const toggle = el("button", hasChildren ? "tree-toggle" : "tree-toggle placeholder", hasChildren ? (node.expanded ? "▾" : "▸") : "");
+        if (hasChildren) {
+            toggle.type = "button";
+            toggle.addEventListener("click", event => {
+                event.stopPropagation();
+                node.expanded = !node.expanded;
+                section.__renderTree();
+            });
+        }
+
+        const mark = el("span", "tree-mark", node.hasSelfChange ? statusMark[node.status] : (node.hasAnyChange ? "•" : "o"));
+        const name = setTitle(el("span", "tree-name", node.name), node.path);
+
+        row.appendChild(toggle);
+        row.appendChild(mark);
+        row.appendChild(name);
+
+        row.addEventListener("click", () => selectPath(section, node.path));
+        row.addEventListener("dblclick", () => {
+            if (!hasChildren) return;
+            node.expanded = !node.expanded;
+            section.__renderTree();
+            selectPath(section, node.path);
+        });
+
+        container.appendChild(row);
+    }
+
+    function renderInspectorShell() {
+        const fragment = document.createDocumentFragment();
+        const toolbar = el("div", "panel-toolbar");
+        toolbar.appendChild(el("span", "", "Inspector"));
+        fragment.appendChild(toolbar);
+        fragment.appendChild(el("div", "inspector-scroll"));
+        return fragment;
+    }
+
+    function selectPath(section, path) {
+        const rows = section.querySelectorAll(".tree-row");
+        rows.forEach(row => row.classList.toggle("active", row.dataset.path === path));
+        const active = section.querySelector(`.tree-row[data-path="${cssEscape(path)}"]`);
+        if (active) active.scrollIntoView({ block: "nearest" });
+        renderInspector(section, path);
+    }
+
+    function cssEscape(value) {
+        if (window.CSS && CSS.escape) return CSS.escape(value);
+        return String(value).replace(/["\\]/g, "\\$&");
+    }
+
+    function renderInspector(section, path) {
+        const report = section.__report;
+        const changeMap = section.__changeMap;
+        const scroll = section.querySelector(".inspector-scroll");
+        const inspector = section.querySelector(".inspector");
+        const oldSummary = inspector.querySelector(".node-summary");
+        if (oldSummary) oldSummary.remove();
+        scroll.textContent = "";
+
+        const change = changeMap.get(path) || { status: "unchanged" };
+        const summary = renderNodeSummary(path, change.status);
+        inspector.insertBefore(summary, scroll);
+
+        const groups = buildComponentGroups(change);
+        if (!groups.length) {
+            const message = change.status === "unchanged"
+                ? "当前节点没有属性变更。"
+                : "仅检测到节点新增/删除，没有可展示的组件属性。";
+            scroll.appendChild(el("div", "empty", message));
+            return;
+        }
+        groups.forEach(group => scroll.appendChild(renderComponent(group)));
+    }
+
+    function renderNodeSummary(path, status) {
+        const summary = el("div", "node-summary");
+        const title = el("div", "node-title");
+        title.appendChild(el("span", "node-name", basename(path)));
+        title.appendChild(renderStatus(status));
+        summary.appendChild(title);
+        summary.appendChild(setTitle(el("div", "node-path", path || "(root)"), path || "(root)"));
+        return summary;
+    }
+
+    function buildComponentGroups(change) {
+        const groups = new Map();
+        const addRow = row => {
+            const info = splitProperty(row.key);
+            const component = info.component;
+            if (!groups.has(component)) groups.set(component, []);
+            groups.get(component).push({ ...row, field: info.field });
+        };
+
+        if (change.status === "added" || change.status === "removed") {
+            asArray(change.props).forEach(prop => addRow({
+                type: change.status,
+                key: prop.key,
+                value: prop.value
+            }));
+        } else if (change.status === "modified") {
+            asArray(change.changed).forEach(prop => addRow({
+                type: "modified",
+                key: prop.key,
+                old: prop.old,
+                new: prop.new
+            }));
+            asArray(change.added).forEach(prop => addRow({
+                type: "added",
+                key: prop.key,
+                value: prop.value
+            }));
+            asArray(change.removed).forEach(prop => addRow({
+                type: "removed",
+                key: prop.key,
+                value: prop.value
+            }));
+        }
+
+        return Array.from(groups.entries()).map(([name, rows]) => ({ name, rows }));
+    }
+
+    function splitProperty(key) {
+        const text = String(key || "");
+        if (!text) return { component: "Properties", field: "(empty)" };
+        if (text === "[Flags]" || text.startsWith("[") && text.endsWith("]")) {
+            return { component: "Node", field: text };
+        }
+        const index = text.indexOf(".");
+        if (index <= 0) return { component: "Properties", field: text };
+        return {
+            component: text.slice(0, index),
+            field: text.slice(index + 1) || text
+        };
+    }
+
+    function renderComponent(group) {
+        const component = el("section", "component");
+        const head = el("button", "component-head");
+        head.type = "button";
+
+        const title = el("span", "component-title");
+        const arrow = el("span", "", "▾");
+        title.appendChild(arrow);
+        title.appendChild(el("span", "", group.name));
+        head.appendChild(title);
+        head.appendChild(el("span", "component-count", `${group.rows.length} 项`));
+        component.appendChild(head);
+
+        const body = el("div", "component-body");
+        group.rows.forEach(row => body.appendChild(renderPropertyRow(row)));
+        component.appendChild(body);
+
+        head.addEventListener("click", () => {
+            component.classList.toggle("collapsed");
+            arrow.textContent = component.classList.contains("collapsed") ? "▸" : "▾";
+        });
+        return component;
+    }
+
+    function renderPropertyRow(row) {
+        const item = el("div", `prop-row ${row.type}`);
+        item.appendChild(setTitle(el("div", "prop-name", row.field), row.key));
+        const values = el("div", "prop-values");
+        if (row.type === "modified") {
+            values.appendChild(renderValue(row.old, "removed"));
+            values.appendChild(el("span", "arrow", "→"));
+            values.appendChild(renderValue(row.new, "added"));
+        } else {
+            values.classList.add("single");
+            values.appendChild(renderValue(row.value, row.type));
+        }
+        item.appendChild(values);
+        return item;
+    }
+
+    function renderValue(value, type) {
+        const text = value === "" || value === undefined || value === null ? "(empty)" : String(value);
+        return el("span", `value ${type}`, text);
+    }
+
+    function initResizer(panel, splitter) {
+        let dragging = false;
+        const move = event => {
+            if (!dragging) return;
+            const rect = panel.getBoundingClientRect();
+            const width = Math.max(220, Math.min(event.clientX - rect.left, rect.width - 360));
+            panel.style.gridTemplateColumns = `${width}px 6px minmax(260px, 1fr)`;
+        };
+        const stop = () => {
+            dragging = false;
+            splitter.classList.remove("dragging");
+            document.removeEventListener("mousemove", move);
+            document.removeEventListener("mouseup", stop);
+        };
+        splitter.addEventListener("mousedown", event => {
+            event.preventDefault();
+            dragging = true;
+            splitter.classList.add("dragging");
+            document.addEventListener("mousemove", move);
+            document.addEventListener("mouseup", stop);
+        });
+    }
+
+    renderApp();
+})();
+</script>
+</body>
+</html>
