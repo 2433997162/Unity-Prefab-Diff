@@ -331,7 +331,7 @@ def diff_prefab(old_nodes: OrderedDict, new_nodes: OrderedDict) -> dict:
         old_props = old_nodes[p]
         new_props = new_nodes[p]
 
-        # 忽略 __flags__ 的差异（如 Inactive 切换也算修改）
+        # __flags__ 是生成的节点状态元数据；普通字段比较里跳过，下面转成 [Flags] 行展示。
         old_keys = set(k for k in old_props if k != "__flags__")
         new_keys = set(k for k in new_props if k != "__flags__")
 

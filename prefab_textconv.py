@@ -488,6 +488,7 @@ def build_caches(project_root: str):
         _prefab_legacy_go_paths.clear()
         _prefab_legacy_component_names.clear()
         _prefab_similar_target_hints.clear()
+        _prefab_record_metadata.clear()
     _cache_project_root = project_root
     if _try_load_disk_cache(project_root):
         return
@@ -523,6 +524,7 @@ _prefab_legacy_go_names = {}  # (git context, guid) → {historical fid: go_name
 _prefab_legacy_go_paths = {}  # (git context, guid) → {historical fid: go_path}
 _prefab_legacy_component_names = {}  # (git context, guid) → {historical fid: component_name}
 _prefab_similar_target_hints = {}  # (git context, target_guid, missing_fid) → (name, path, component)
+_prefab_record_metadata = {}  # (context, guid, component fid) → Localize m_records metadata
 
 def _prefab_name_cache_key(guid: str, use_resolver: bool):
     resolver_key = _asset_resolver.cache_key if use_resolver and _asset_resolver else f'disk:{_cache_project_root}'
@@ -1289,6 +1291,12 @@ FILEID_REF_RE = re.compile(
     r'(?:\s*,\s*type:\s*\d+)?\s*\}'
 )
 UNICODE_ESCAPE_RE = re.compile(r'\\u([0-9a-fA-F]{4})')
+COLOR_CHANNEL_RE = re.compile(r'^(.+)\.([rgba])$')
+PACKED_RGBA_RE = re.compile(r'^(.+)\.rgba$')
+INLINE_COLOR_OBJECT_RE = re.compile(
+    r'^\{\s*r\s*:\s*([^,{}]+)\s*,\s*g\s*:\s*([^,{}]+)\s*,'
+    r'\s*b\s*:\s*([^,{}]+)\s*,\s*a\s*:\s*([^,{}]+)\s*\}$'
+)
 
 
 def _decode_unicode_escapes(value: str) -> str:
@@ -1342,6 +1350,169 @@ def translate_fileid_refs(value, ref_resolver=None):
     return FILEID_REF_RE.sub(repl, value)
 
 
+def _is_color_base(key: str) -> bool:
+    lower = (key or '').lower()
+    return 'color' in lower or 'tint' in lower
+
+
+def _parse_float_text(value):
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_int_text(value):
+    try:
+        return int(str(value).strip(), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_float(value: float) -> str:
+    text = f'{value:.4f}'.rstrip('0').rstrip('.')
+    return text or '0'
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _format_rgba_color(channels):
+    numeric = {channel: _parse_float_text(channels.get(channel, '')) for channel in 'rgba'}
+    if any(numeric[channel] is None for channel in 'rgba'):
+        return ''
+    rgb = [round(_clamp01(numeric[channel]) * 255) for channel in 'rgb']
+    alpha_float = _clamp01(numeric['a'])
+    alpha_255 = round(alpha_float * 255)
+    rgba = f'rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, {_compact_float(alpha_float)})'
+    hex_value = f'#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}{alpha_255:02X}'
+    raw = ', '.join(f'{channel}: {channels[channel]}' for channel in 'rgba')
+    return f'{rgba} {hex_value} {{{raw}}}'
+
+
+def _format_packed_rgba_color(value):
+    raw_value = _parse_int_text(value)
+    if raw_value is None:
+        return ''
+    packed = raw_value & 0xFFFFFFFF
+    if raw_value != packed and raw_value + (1 << 32) != packed:
+        return ''
+    r = packed & 0xFF
+    g = (packed >> 8) & 0xFF
+    b = (packed >> 16) & 0xFF
+    a = (packed >> 24) & 0xFF
+    alpha = a / 255
+    rgba = f'rgba({r}, {g}, {b}, {_compact_float(alpha)})'
+    hex_value = f'#{r:02X}{g:02X}{b:02X}{a:02X}'
+    return f'{rgba} {hex_value} {{rgba: {value}, hex: 0x{packed:08X}, r: {r}, g: {g}, b: {b}, a: {a}}}'
+
+
+def _format_inline_color_value(key, value):
+    if not _is_color_base(key) or not value or '{' not in value:
+        return value
+    match = INLINE_COLOR_OBJECT_RE.match(str(value).strip())
+    if not match:
+        return value
+    pairs = dict(zip('rgba', (part.strip() for part in match.groups())))
+    formatted = _format_rgba_color({channel: pairs[channel].strip() for channel in 'rgba'})
+    return formatted or value
+
+
+def _split_packed_rgba_key(key):
+    match = PACKED_RGBA_RE.match(key or '')
+    if not match:
+        return ''
+    base = match.group(1)
+    return base if _is_color_base(base) else ''
+
+
+def _format_color_prop_pair(key, value):
+    packed_base = _split_packed_rgba_key(key)
+    if packed_base:
+        formatted = _format_packed_rgba_color(value)
+        if formatted:
+            return packed_base, formatted
+    return key, _format_inline_color_value(key, value)
+
+
+def _split_color_channel_key(key):
+    match = COLOR_CHANNEL_RE.match(key or '')
+    if not match:
+        return '', ''
+    base, channel = match.group(1), match.group(2)
+    if not _is_color_base(base):
+        return '', ''
+    return base, channel
+
+
+def _combine_color_prop_pairs(props):
+    groups = defaultdict(dict)
+    first_index = {}
+    for index, (key, value) in enumerate(props):
+        base, channel = _split_color_channel_key(key)
+        if not base or _parse_float_text(value) is None:
+            continue
+        groups[base][channel] = (value, index)
+        first_index.setdefault(base, index)
+
+    complete = {
+        base: {channel: groups[base][channel][0] for channel in 'rgba'}
+        for base in groups
+        if all(channel in groups[base] for channel in 'rgba')
+    }
+    consumed = {
+        groups[base][channel][1]
+        for base in complete
+        for channel in 'rgba'
+    }
+
+    result = []
+    for index, (key, value) in enumerate(props):
+        if index in consumed:
+            base, _channel = _split_color_channel_key(key)
+            if first_index.get(base) == index:
+                result.append((base, _format_rgba_color(complete[base])))
+            continue
+        result.append(_format_color_prop_pair(key, value))
+    return result
+
+
+def _combine_color_mods(mods):
+    groups = defaultdict(dict)
+    first_index = {}
+    for index, (tfid, tguid, prop, value) in enumerate(mods):
+        base, channel = _split_color_channel_key(prop)
+        if not base or _parse_float_text(value) is None:
+            continue
+        group_key = (tfid, tguid, base)
+        groups[group_key][channel] = (value, index)
+        first_index.setdefault(group_key, index)
+
+    complete = {
+        group_key: {channel: groups[group_key][channel][0] for channel in 'rgba'}
+        for group_key in groups
+        if all(channel in groups[group_key] for channel in 'rgba')
+    }
+    consumed = {
+        groups[group_key][channel][1]
+        for group_key in complete
+        for channel in 'rgba'
+    }
+
+    result = []
+    for index, (tfid, tguid, prop, value) in enumerate(mods):
+        if index in consumed:
+            base, _channel = _split_color_channel_key(prop)
+            group_key = (tfid, tguid, base)
+            if first_index.get(group_key) == index:
+                result.append((tfid, tguid, base, _format_rgba_color(complete[group_key])))
+            continue
+        formatted_key, formatted_value = _format_color_prop_pair(prop, value)
+        result.append((tfid, tguid, formatted_key, formatted_value))
+    return result
+
+
 def _indent_len(line):
     return len(line) - len(line.lstrip(' '))
 
@@ -1351,7 +1522,8 @@ def _skip_yaml_block(lines, idx):
     idx += 1
     while idx < len(lines):
         stripped = lines[idx].strip()
-        if stripped and _indent_len(lines[idx]) <= base_indent:
+        indent = _indent_len(lines[idx])
+        if stripped and indent <= base_indent and not (indent == base_indent and stripped.startswith('- ')):
             break
         idx += 1
     return idx
@@ -1388,10 +1560,9 @@ def _summarize_managed_ref(entry_lines, ref_resolver=None):
     return ref_type
 
 
-def extract_managed_reference_props(body, ref_resolver=None):
-    """Return stable summaries for Unity SerializeReference entries."""
-    lines = body.splitlines()
-    summaries = []
+def _managed_ref_summaries(lines, ref_resolver=None):
+    """Return rid -> summary for Unity SerializeReference entries."""
+    summaries = {}
     idx = 0
     while idx < len(lines):
         if lines[idx].strip() != 'references:':
@@ -1420,6 +1591,7 @@ def extract_managed_reference_props(body, ref_resolver=None):
                     idx += 1
                     continue
 
+                rid = stripped.split(':', 1)[1].strip()
                 entry_indent = _indent_len(lines[idx])
                 entry_lines = []
                 idx += 1
@@ -1434,13 +1606,241 @@ def extract_managed_reference_props(body, ref_resolver=None):
                     idx += 1
 
                 summary = _summarize_managed_ref(entry_lines, ref_resolver)
-                if summary:
-                    summaries.append(summary)
+                if rid:
+                    summaries[rid] = summary or f'UnresolvedManagedReference:{rid}'
 
         # Continue scanning in case Unity ever emits multiple references blocks.
+    return summaries
 
-    summaries.sort()
-    return [(f'managedReference[{idx}]', summary) for idx, summary in enumerate(summaries)]
+
+def _component_ref_key(value, ref_resolver=None):
+    m = FILEID_REF_RE.search(value or '')
+    if not m:
+        return ''
+    fid = m.group(1)
+    label = ref_resolver(fid) if ref_resolver else ''
+    if label and '/' in label:
+        return label.rsplit('/', 1)[-1]
+    if label:
+        return label
+    return f'fileID:{fid}'
+
+
+def _parse_localize_record_metadata(lines, ref_resolver=None, ref_summaries=None):
+    ref_summaries = ref_summaries or {}
+    records = {}
+    idx = 0
+    while idx < len(lines):
+        if lines[idx].strip() != 'm_records:':
+            idx += 1
+            continue
+
+        record_index = 0
+        records_indent = _indent_len(lines[idx])
+        idx += 1
+        while idx < len(lines):
+            stripped = lines[idx].strip()
+            indent = _indent_len(lines[idx])
+            if stripped and (indent < records_indent or (indent == records_indent and not stripped.startswith('- '))):
+                break
+            if not stripped.startswith('- m_component:'):
+                idx += 1
+                continue
+
+            record_indent = indent
+            component_key = _component_ref_key(stripped.split(':', 1)[1].strip(), ref_resolver)
+            property_name = ''
+            pairs = {}
+            pair_values = {}
+            pair_index = 0
+            idx += 1
+            while idx < len(lines):
+                current = lines[idx].strip()
+                current_indent = _indent_len(lines[idx])
+                if current and (current_indent < records_indent or
+                                (current_indent == records_indent and not current.startswith('- '))):
+                    break
+                if current.startswith('- m_component:') and current_indent == record_indent:
+                    break
+                if current.startswith('m_propertyName:'):
+                    property_name = current.split(':', 1)[1].strip()
+                    idx += 1
+                    continue
+                if current.startswith('- m_key:'):
+                    pair_indent = current_indent
+                    locale_key = current.split(':', 1)[1].strip() or 'default'
+                    rid = ''
+                    idx += 1
+                    while idx < len(lines):
+                        pair_line = lines[idx].strip()
+                        pair_line_indent = _indent_len(lines[idx])
+                        if pair_line and (pair_line_indent < records_indent or
+                                          (pair_line_indent == records_indent and not pair_line.startswith('- '))):
+                            break
+                        if pair_line.startswith('- m_component:') and pair_line_indent == record_indent:
+                            break
+                        if pair_line.startswith('- m_key:') and pair_line_indent == pair_indent:
+                            break
+                        if pair_line.startswith('rid:'):
+                            rid = pair_line.split(':', 1)[1].strip()
+                        idx += 1
+                    pairs[pair_index] = locale_key
+                    if rid and ref_summaries.get(rid):
+                        pair_values[pair_index] = ref_summaries[rid]
+                    pair_index += 1
+                    continue
+                idx += 1
+
+            record_key = property_name or 'record'
+            if component_key:
+                record_key = f'{component_key}.{record_key}'
+            records[record_index] = {
+                'record_key': record_key,
+                'pairs': pairs,
+                'values': pair_values,
+            }
+            record_index += 1
+
+    return records
+
+
+def _source_record_metadata(guid: str, fid: str):
+    if not guid or not fid:
+        return {}
+
+    use_resolver = bool(_asset_resolver)
+    cache_key = (_prefab_name_cache_key(guid, use_resolver), guid, fid)
+    if cache_key in _prefab_record_metadata:
+        return _prefab_record_metadata[cache_key]
+
+    def source_ref_resolver(ref_fid):
+        component = prefab_target_component(guid, ref_fid)
+        if component:
+            return component
+        path = prefab_target_path(guid, ref_fid)
+        if path:
+            return path
+        name = prefab_target_label(guid, ref_fid)
+        return '' if name.startswith('UnknownTarget:') else name
+
+    for _type_id, section_fid, body, _is_stripped in _prefab_sections_for_guid(guid, use_resolver=use_resolver):
+        if section_fid == fid:
+            lines = body.splitlines()
+            metadata = _parse_localize_record_metadata(
+                lines,
+                source_ref_resolver,
+                _managed_ref_summaries(lines, source_ref_resolver),
+            )
+            _prefab_record_metadata[cache_key] = metadata
+            return metadata
+
+    _prefab_record_metadata[cache_key] = {}
+    return {}
+
+
+def _extract_localize_record_props(lines, ref_summaries, ref_resolver=None):
+    props = []
+    consumed_rids = set()
+    skip_ranges = []
+    idx = 0
+    while idx < len(lines):
+        if lines[idx].strip() != 'm_records:':
+            idx += 1
+            continue
+
+        record_start = idx
+        has_record_props = False
+        records_indent = _indent_len(lines[idx])
+        idx += 1
+        while idx < len(lines):
+            stripped = lines[idx].strip()
+            indent = _indent_len(lines[idx])
+            if stripped and (indent < records_indent or (indent == records_indent and not stripped.startswith('- '))):
+                break
+            if not stripped.startswith('- m_component:'):
+                idx += 1
+                continue
+
+            record_indent = indent
+            component_key = _component_ref_key(stripped.split(':', 1)[1].strip(), ref_resolver)
+            property_name = ''
+            pairs = []
+            idx += 1
+            while idx < len(lines):
+                current = lines[idx].strip()
+                current_indent = _indent_len(lines[idx])
+                if current and (current_indent < records_indent or
+                                (current_indent == records_indent and not current.startswith('- '))):
+                    break
+                if current.startswith('- m_component:') and current_indent == record_indent:
+                    break
+                if current.startswith('m_propertyName:'):
+                    property_name = current.split(':', 1)[1].strip()
+                    idx += 1
+                    continue
+                if current.startswith('- m_key:'):
+                    pair_indent = current_indent
+                    locale_key = current.split(':', 1)[1].strip() or 'default'
+                    rid = ''
+                    saw_rid = False
+                    idx += 1
+                    while idx < len(lines):
+                        pair_line = lines[idx].strip()
+                        pair_line_indent = _indent_len(lines[idx])
+                        if pair_line and (pair_line_indent < records_indent or
+                                          (pair_line_indent == records_indent and not pair_line.startswith('- '))):
+                            break
+                        if pair_line.startswith('- m_component:') and pair_line_indent == record_indent:
+                            break
+                        if pair_line.startswith('- m_key:') and pair_line_indent == pair_indent:
+                            break
+                        if pair_line.startswith('rid:'):
+                            saw_rid = True
+                            rid = pair_line.split(':', 1)[1].strip()
+                        idx += 1
+                    if rid or saw_rid:
+                        pairs.append((locale_key, rid))
+                    continue
+                idx += 1
+
+            record_key = property_name or 'record'
+            if component_key:
+                record_key = f'{component_key}.{record_key}'
+            for locale_key, rid in pairs:
+                prop_key = f'm_records[{record_key}].m_pairs[{locale_key}]'
+                if rid:
+                    summary = ref_summaries.get(rid) or f'UnresolvedManagedReference:{rid}'
+                    props.append((prop_key, summary))
+                    consumed_rids.add(rid)
+                else:
+                    props.append((f'{prop_key}.rid', 'UnresolvedManagedReference:(missing rid)'))
+                has_record_props = True
+
+        if has_record_props:
+            skip_ranges.append((record_start, idx))
+
+    return props, consumed_rids, skip_ranges
+
+
+def _extract_managed_reference_props(body, ref_resolver=None):
+    """Return stable summaries for Unity SerializeReference entries."""
+    lines = body.splitlines()
+    ref_summaries = _managed_ref_summaries(lines, ref_resolver)
+    if not ref_summaries:
+        return [], []
+
+    record_props, consumed_rids, skip_ranges = _extract_localize_record_props(lines, ref_summaries, ref_resolver)
+    fallback_props = [
+        (f'managedReference[rid:{rid}]', ref_summaries[rid])
+        for rid in sorted(ref_summaries)
+        if rid not in consumed_rids
+    ]
+    return record_props + fallback_props, skip_ranges
+
+
+def extract_managed_reference_props(body, ref_resolver=None):
+    props, _skip_ranges = _extract_managed_reference_props(body, ref_resolver)
+    return props
 
 
 def extract_props(body, ref_resolver=None):
@@ -1449,7 +1849,8 @@ def extract_props(body, ref_resolver=None):
     Handles simple key: value lines. Skips noise keys.
     Returns list of (key, val).
     """
-    props = extract_managed_reference_props(body, ref_resolver)
+    props, managed_record_skip_ranges = _extract_managed_reference_props(body, ref_resolver)
+    managed_record_skip_starts = {start: end for start, end in managed_record_skip_ranges}
     lines = body.splitlines()
     idx = 0
     while idx < len(lines):
@@ -1463,6 +1864,9 @@ def extract_props(body, ref_resolver=None):
         val = stripped[colon+1:].strip()
         if key == 'references':
             idx = _skip_yaml_block(lines, idx)
+            continue
+        if key == 'm_records' and idx in managed_record_skip_starts:
+            idx = managed_record_skip_starts[idx]
             continue
         if key == 'rid' and _indent_len(line) > 2:
             idx += 1
@@ -1491,7 +1895,7 @@ def extract_props(body, ref_resolver=None):
         if key and val is not None:
             props.append((key, val))
         idx += 1
-    return props
+    return _combine_color_prop_pairs(props)
 
 
 def parse_prefab_instance_mods(body):
@@ -1523,6 +1927,11 @@ def parse_prefab_instance_mods(body):
 
 
 MANAGED_MOD_RE = re.compile(r'^managedReferences\[(\d+)\](?:\.(.+))?$')
+M_RECORD_PAIR_VALUE_RE = re.compile(
+    r'^m_records\.Array\.data\[(\d+)\]\.m_values\.m_pairs\.Array\.data\[(\d+)\]\.(.+)$'
+)
+M_RECORD_PAIR_ARRAY_RE = re.compile(r'^m_records\.Array\.data\[(\d+)\]\.m_values\.m_pairs\.Array\.(.+)$')
+M_RECORD_FIELD_RE = re.compile(r'^m_records\.Array\.data\[(\d+)\]\.(.+)$')
 
 
 def _managed_mod_type(value):
@@ -1542,16 +1951,70 @@ def _managed_ref_summary(ref):
     return ref_type
 
 
-def normalize_prefab_instance_mods(mods):
+def _collect_record_pair_keys(mods, source_guid=''):
+    pair_keys = {}
+    for tfid, tguid, prop, value in mods:
+        pair_m = M_RECORD_PAIR_VALUE_RE.match(prop)
+        if not pair_m or pair_m.group(3) != 'm_key':
+            continue
+        target_guid = tguid or source_guid
+        record_index = int(pair_m.group(1))
+        pair_index = int(pair_m.group(2))
+        pair_keys[(target_guid, tfid, record_index, pair_index)] = value or 'default'
+    return pair_keys
+
+
+def _record_override_key(target_guid, tfid, prop, value='', pair_keys=None):
+    pair_keys = pair_keys or {}
+    pair_m = M_RECORD_PAIR_VALUE_RE.match(prop)
+    array_m = M_RECORD_PAIR_ARRAY_RE.match(prop)
+    field_m = M_RECORD_FIELD_RE.match(prop)
+    if not (pair_m or array_m or field_m):
+        return prop
+
+    record_index = int((pair_m or array_m or field_m).group(1))
+    record = _source_record_metadata(target_guid, tfid).get(record_index, {})
+    record_key = record.get('record_key') or f'record#{record_index}'
+
+    if pair_m:
+        pair_index = int(pair_m.group(2))
+        suffix = pair_m.group(3)
+        pair_key = (target_guid, tfid, record_index, pair_index)
+        if suffix == 'm_key':
+            locale_key = value or pair_keys.get(pair_key) or 'default'
+        else:
+            locale_key = pair_keys.get(pair_key) or record.get('pairs', {}).get(pair_index) or ''
+        locale_key = locale_key or f'pair#{pair_index}'
+        if suffix in {'m_value', 'managedValue'}:
+            return f'm_records[{record_key}].m_pairs[{locale_key}]'
+        return f'm_records[{record_key}].m_pairs[{locale_key}].{suffix}'
+
+    if array_m:
+        return f'm_records[{record_key}].m_pairs.{array_m.group(2)}'
+
+    return f'm_records[{record_key}].{field_m.group(2)}'
+
+
+def _record_override_source_value(target_guid, tfid, prop):
+    pair_m = M_RECORD_PAIR_VALUE_RE.match(prop)
+    if not pair_m:
+        return ''
+    record = _source_record_metadata(target_guid, tfid).get(int(pair_m.group(1)), {})
+    return record.get('values', {}).get(int(pair_m.group(2)), '')
+
+
+def normalize_prefab_instance_mods(mods, source_guid=''):
     """Remove Unity-managed SerializeReference ids from prefab overrides."""
     managed_refs = defaultdict(dict)
-    for tfid, _tguid, prop, value in mods:
+    record_pair_keys = _collect_record_pair_keys(mods, source_guid)
+    for tfid, tguid, prop, value in mods:
         managed_m = MANAGED_MOD_RE.match(prop)
         if not managed_m:
             continue
+        target_guid = tguid or source_guid
         rid = managed_m.group(1)
         sub_path = managed_m.group(2) or ''
-        ref = managed_refs[tfid].setdefault(rid, {'type': '', 'values': {}})
+        ref = managed_refs[(target_guid, tfid)].setdefault(rid, {'type': '', 'values': {}})
         if sub_path:
             ref['values'][sub_path] = value
         else:
@@ -1559,15 +2022,22 @@ def normalize_prefab_instance_mods(mods):
 
     normalized = []
     for tfid, tguid, prop, value in mods:
+        target_guid = tguid or source_guid
         if MANAGED_MOD_RE.match(prop):
             continue
         if prop.startswith('m_records.') and prop.endswith('.m_value') and re.fullmatch(r'-?\d+', value or ''):
-            summary = _managed_ref_summary(managed_refs.get(tfid, {}).get(value, {}))
-            if summary:
-                normalized.append((tfid, tguid, prop[:-len('.m_value')] + '.managedValue', summary))
+            summary = _managed_ref_summary(managed_refs.get((target_guid, tfid), {}).get(value, {}))
+            if not summary:
+                summary = _record_override_source_value(target_guid, tfid, prop)
+            if not summary:
+                summary = f'UnresolvedManagedReference:{value}'
+            normalized.append((tfid, tguid, _record_override_key(target_guid, tfid, prop, value, record_pair_keys), summary))
+            continue
+        if prop.startswith('m_records.'):
+            normalized.append((tfid, tguid, _record_override_key(target_guid, tfid, prop, value, record_pair_keys), value))
             continue
         normalized.append((tfid, tguid, prop, value))
-    return normalized
+    return _combine_color_mods(normalized)
 
 
 def main():
@@ -1770,7 +2240,7 @@ def convert(content):
         src_guid, _parent_fid, body = pi_info[pi_fid]
         src_name = prefab_label(src_guid)
 
-        mods = normalize_prefab_instance_mods(parse_prefab_instance_mods(body))
+        mods = normalize_prefab_instance_mods(parse_prefab_instance_mods(body), src_guid)
         custom_name = next((v for _, _, p, v in mods if p == 'm_Name'), None)
 
         if custom_name:

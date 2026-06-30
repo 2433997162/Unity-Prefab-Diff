@@ -10,6 +10,10 @@
 - `prefab_textconv.py`：把 Unity YAML 转成稳定、可比较的结构化文本。
 - `prefab_html_renderer.py` 和 `prefab_diff_template.html`：把 diff 数据渲染为 HTML。
 
+## 文档
+
+- [HTML 数据契约](docs/html-data-contract.md)：说明注入 HTML 的 JSON 结构，以及进入 HTML 前已经特殊处理过的字段和值。修改 `prefab_diff_template.html` 前建议先看这里。
+
 ## Unity 项目根目录
 
 建议尽量显式传入 Unity 项目根目录：

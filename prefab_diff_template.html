@@ -462,7 +462,9 @@ input {
 }
 
 .value {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     max-width: 100%;
     padding: 2px 7px;
     border-radius: 4px;
@@ -471,6 +473,35 @@ input {
     line-height: 1.45;
     white-space: pre-wrap;
     word-break: break-word;
+}
+
+.value-text {
+    min-width: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.color-swatch {
+    display: inline-flex;
+    flex: 0 0 auto;
+    width: 16px;
+    height: 16px;
+    padding: 1px;
+    border: 1px solid rgba(77, 91, 106, .35);
+    border-radius: 3px;
+    background:
+        linear-gradient(45deg, #cbd5df 25%, transparent 25%),
+        linear-gradient(-45deg, #cbd5df 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #cbd5df 75%),
+        linear-gradient(-45deg, transparent 75%, #cbd5df 75%),
+        #fff;
+    background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+    background-size: 12px 12px;
+}
+
+.color-swatch-fill {
+    flex: 1;
+    border-radius: 2px;
 }
 
 .value.added {
@@ -879,6 +910,7 @@ input {
     function buildComponentGroups(change) {
         const groups = new Map();
         const addRow = row => {
+            if (isInternalProperty(row.key)) return;
             const info = splitProperty(row.key);
             const component = info.component;
             if (!groups.has(component)) groups.set(component, []);
@@ -911,6 +943,10 @@ input {
         }
 
         return Array.from(groups.entries()).map(([name, rows]) => ({ name, rows }));
+    }
+
+    function isInternalProperty(key) {
+        return String(key || "") === "__flags__";
     }
 
     function splitProperty(key) {
@@ -967,9 +1003,30 @@ input {
         return item;
     }
 
+    function parseRgbaCss(text) {
+        const match = String(text || "").match(/rgba\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*([0-9.]+)\s*\)/);
+        if (!match) return "";
+        const r = Math.max(0, Math.min(255, Number(match[1])));
+        const g = Math.max(0, Math.min(255, Number(match[2])));
+        const b = Math.max(0, Math.min(255, Number(match[3])));
+        const a = Math.max(0, Math.min(1, Number(match[4])));
+        return `rgba(${r}, ${g}, ${b}, ${a})`;
+    }
+
     function renderValue(value, type) {
         const text = value === "" || value === undefined || value === null ? "(empty)" : String(value);
-        return el("span", `value ${type}`, text);
+        const wrapper = el("span", `value ${type}`);
+        const color = parseRgbaCss(text);
+        if (color) {
+            const swatch = el("span", "color-swatch");
+            const fill = el("span", "color-swatch-fill");
+            fill.style.backgroundColor = color;
+            swatch.title = color;
+            swatch.appendChild(fill);
+            wrapper.appendChild(swatch);
+        }
+        wrapper.appendChild(el("span", "value-text", text));
+        return wrapper;
     }
 
     function initResizer(panel, splitter) {
