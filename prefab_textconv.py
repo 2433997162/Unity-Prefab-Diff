@@ -616,7 +616,7 @@ def _build_direct_prefab_go_index_from_sections(sections):
         if type_id == 1:
             nm = re.search(r'm_Name:\s*(.+)', body)
             if nm:
-                name = nm.group(1).strip()
+                name = _decode_unicode_escapes(nm.group(1).strip())
                 go_names[fid] = name
                 result_names[fid] = name
         elif type_id in (4, 224):
@@ -901,7 +901,7 @@ def _build_prefab_go_index(guid, _depth=0, use_resolver=False):
         elif type_id == 1:
             nm = re.search(r'm_Name:\s*(.+)', body)
             if nm:
-                name = nm.group(1).strip()
+                name = _decode_unicode_escapes(nm.group(1).strip())
                 go_names[fid] = name
                 result_names[fid] = name
         elif type_id in (4, 224):
@@ -1288,10 +1288,41 @@ FILEID_REF_RE = re.compile(
     r'(?:\s*,\s*guid:\s*([0-9a-f]+))?'
     r'(?:\s*,\s*type:\s*\d+)?\s*\}'
 )
+UNICODE_ESCAPE_RE = re.compile(r'\\u([0-9a-fA-F]{4})')
+
+
+def _decode_unicode_escapes(value: str) -> str:
+    if not value or '\\u' not in value:
+        return value
+
+    out = []
+    pos = 0
+    matches = list(UNICODE_ESCAPE_RE.finditer(value))
+    idx = 0
+    while idx < len(matches):
+        match = matches[idx]
+        out.append(value[pos:match.start()])
+        code_unit = int(match.group(1), 16)
+        next_match = matches[idx + 1] if idx + 1 < len(matches) else None
+        if 0xD800 <= code_unit <= 0xDBFF and next_match and next_match.start() == match.end():
+            low_unit = int(next_match.group(1), 16)
+            if 0xDC00 <= low_unit <= 0xDFFF:
+                code_point = 0x10000 + ((code_unit - 0xD800) << 10) + (low_unit - 0xDC00)
+                out.append(chr(code_point))
+                pos = next_match.end()
+                idx += 2
+                continue
+        out.append(chr(code_unit))
+        pos = match.end()
+        idx += 1
+
+    out.append(value[pos:])
+    return ''.join(out)
 
 
 def translate_fileid_refs(value, ref_resolver=None):
     """Translate local Unity fileID refs embedded anywhere in a value string."""
+    value = _decode_unicode_escapes(value)
     if not value or 'fileID:' not in value:
         return value
 
@@ -1481,7 +1512,7 @@ def parse_prefab_instance_mods(body):
             tfid  = target_m.group(1)
             tguid = target_m.group(2) if target_m.group(2) else ''  # 保留完整 guid
             prop  = path_m.group(1).strip()
-            value = value_m.group(1).strip() if value_m else ''
+            value = _decode_unicode_escapes(value_m.group(1).strip()) if value_m else ''
             object_ref = object_ref_m.group(1).strip() if object_ref_m else ''
             if not value and object_ref:
                 value = object_ref
@@ -1603,7 +1634,7 @@ def convert(content):
             ly = re.search(r'm_Layer:\s*(\d+)', body)
             tg = re.search(r'm_TagString:\s*(.+)', body)
             if nm:
-                go_name[fid] = nm.group(1).strip()
+                go_name[fid] = _decode_unicode_escapes(nm.group(1).strip())
             elif src_m:
                 go_name[fid] = prefab_target_label(src_m.group(2), src_m.group(1))
                 go_source_path[fid] = prefab_target_path(src_m.group(2), src_m.group(1))

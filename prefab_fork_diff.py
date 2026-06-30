@@ -419,6 +419,30 @@ def _infer_git_rev_from_temp_path(path: str) -> str:
     return ""
 
 
+def _sourcegit_temp_slot(path: str) -> str:
+    name = os.path.basename(path or "").lower()
+    stem, _ext = os.path.splitext(name)
+    if stem in {"old", "new"}:
+        return stem
+    return ""
+
+
+def _normalize_sourcegit_old_new_paths(left_path: str, right_path: str):
+    if not _IS_SOURCEGIT_CUSTOM_DIFF:
+        return left_path, right_path
+
+    env_old = os.environ.get("SOURCEGIT_CUSTOM_DIFF_OLD") or ""
+    env_new = os.environ.get("SOURCEGIT_CUSTOM_DIFF_NEW") or ""
+    if env_old or env_new:
+        return env_old or left_path, env_new or right_path
+
+    left_slot = _sourcegit_temp_slot(left_path)
+    right_slot = _sourcegit_temp_slot(right_path)
+    if left_slot == "new" and right_slot == "old":
+        return right_path, left_path
+    return left_path, right_path
+
+
 def run_prefab_diff(left_path: str, right_path: str, report_mode: str = REPORT_MODE_FULL, project_root: str = ""):
     """主入口：对比两个 prefab 文件并生成 HTML"""
     report_mode = _normalize_report_mode(report_mode)
@@ -429,6 +453,11 @@ def run_prefab_diff(left_path: str, right_path: str, report_mode: str = REPORT_M
                         format='%(asctime)s %(message)s')
     logging.debug(f"run_prefab_diff called: left={left_path}, right={right_path}, report_mode={report_mode}, project_root={project_root}")
     logging.debug(f"cwd={os.getcwd()}")
+
+    original_left_path, original_right_path = left_path, right_path
+    left_path, right_path = _normalize_sourcegit_old_new_paths(left_path, right_path)
+    if (left_path, right_path) != (original_left_path, original_right_path):
+        logging.debug(f"normalized old/new paths: old={left_path}, new={right_path}")
 
     # 优先使用真实 Assets 路径；Fork 双临时文件对比时退回配置根目录。
     hint_path = next((p for p in [right_path, left_path] if "Assets" in p.replace("\\", "/")), "")
