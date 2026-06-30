@@ -946,7 +946,7 @@ input {
     }
 
     function isInternalProperty(key) {
-        return String(key || "") === "__flags__";
+        return ["__flags__", "__id__", "__parent_id__"].includes(String(key || ""));
     }
 
     function splitProperty(key) {

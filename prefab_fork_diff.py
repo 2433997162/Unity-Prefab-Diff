@@ -15,6 +15,7 @@ import os
 import tempfile
 import webbrowser
 import subprocess
+import re
 from collections import OrderedDict
 
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -301,6 +302,78 @@ def parse_structured_text(text: str) -> OrderedDict:
     return nodes
 
 
+INTERNAL_PROPS = {"__flags__", "__id__", "__parent_id__"}
+FILEID_LABEL_RE = re.compile(r"\{fileID:([^}]+?)\s+->\s+[^}]+\}")
+INTERNAL_DUPLICATE_SUFFIX_RE = re.compile(r"#\d+$")
+
+
+def _node_identity(props):
+    return props.get("__id__", "") if props else ""
+
+
+def _identities_compatible(old_props, new_props):
+    old_id = _node_identity(old_props)
+    new_id = _node_identity(new_props)
+    return not old_id or not new_id or old_id == new_id
+
+
+def _display_path(path):
+    return INTERNAL_DUPLICATE_SUFFIX_RE.sub("", str(path or ""))
+
+
+def _basename(path):
+    return _display_path(path).split("/")[-1]
+
+
+def _parent_path(path):
+    text = _display_path(path)
+    if "/" not in text:
+        return "(root)"
+    return text.rsplit("/", 1)[0] or "(root)"
+
+
+def _stable_compare_value(value):
+    return FILEID_LABEL_RE.sub(r"{fileID:\1}", str(value or ""))
+
+
+def _unique_identity_paths(nodes):
+    by_id = {}
+    duplicated = set()
+    for path, props in nodes.items():
+        node_id = _node_identity(props)
+        if not node_id:
+            continue
+        if node_id in by_id:
+            duplicated.add(node_id)
+            continue
+        by_id[node_id] = path
+    for node_id in duplicated:
+        by_id.pop(node_id, None)
+    return by_id
+
+
+def _match_node_paths(old_nodes, new_nodes):
+    old_paths = set(old_nodes.keys())
+    matches = OrderedDict()
+    used_old = set()
+
+    for path in new_nodes:
+        if path in old_paths and _identities_compatible(old_nodes[path], new_nodes[path]):
+            matches[path] = path
+            used_old.add(path)
+
+    old_by_id = _unique_identity_paths(old_nodes)
+    new_by_id = _unique_identity_paths(new_nodes)
+    for node_id, new_path in new_by_id.items():
+        old_path = old_by_id.get(node_id)
+        if not old_path or new_path in matches or old_path in used_old:
+            continue
+        matches[new_path] = old_path
+        used_old.add(old_path)
+
+    return matches
+
+
 def diff_prefab(old_nodes: OrderedDict, new_nodes: OrderedDict) -> dict:
     """
     对比两个版本的 prefab 结构化数据。
@@ -311,35 +384,44 @@ def diff_prefab(old_nodes: OrderedDict, new_nodes: OrderedDict) -> dict:
         "modified_nodes": {path: {"added": {}, "removed": {}, "changed": {key: (old, new)}}},
     }
     """
-    old_paths = set(old_nodes.keys())
-    new_paths = set(new_nodes.keys())
+    matches = _match_node_paths(old_nodes, new_nodes)
+    matched_new_paths = set(matches.keys())
+    matched_old_paths = set(matches.values())
+    renamed_paths = OrderedDict(
+        (old_path, new_path)
+        for new_path, old_path in matches.items()
+        if old_path != new_path
+    )
 
     added_nodes = OrderedDict()
     for p in new_nodes:
-        if p not in old_paths:
+        if p not in matched_new_paths:
             added_nodes[p] = new_nodes[p]
 
     removed_nodes = OrderedDict()
     for p in old_nodes:
-        if p not in new_paths:
+        if p not in matched_old_paths:
             removed_nodes[p] = old_nodes[p]
 
     modified_nodes = OrderedDict()
-    for p in new_nodes:
-        if p not in old_paths:
+    for p, old_path in matches.items():
+        if p not in new_nodes or old_path not in old_nodes:
             continue
-        old_props = old_nodes[p]
+        old_props = old_nodes[old_path]
         new_props = new_nodes[p]
 
         # __flags__ 是生成的节点状态元数据；普通字段比较里跳过，下面转成 [Flags] 行展示。
-        old_keys = set(k for k in old_props if k != "__flags__")
-        new_keys = set(k for k in new_props if k != "__flags__")
+        old_keys = set(k for k in old_props if k not in INTERNAL_PROPS)
+        new_keys = set(k for k in new_props if k not in INTERNAL_PROPS)
 
         added_props = {k: new_props[k] for k in (new_keys - old_keys)}
         removed_props = {k: old_props[k] for k in (old_keys - new_keys)}
         changed_props = {}
         for k in old_keys & new_keys:
-            if old_props[k] != new_props[k]:
+            if (
+                old_props[k] != new_props[k]
+                and _stable_compare_value(old_props[k]) != _stable_compare_value(new_props[k])
+            ):
                 changed_props[k] = (old_props[k], new_props[k])
 
         # flags 变更（如 active 状态切换）
@@ -347,6 +429,14 @@ def diff_prefab(old_nodes: OrderedDict, new_nodes: OrderedDict) -> dict:
         new_flags = new_props.get("__flags__", "")
         if old_flags != new_flags:
             changed_props["[Flags]"] = (old_flags or "(none)", new_flags or "(none)")
+
+        if old_path != p:
+            old_name = _basename(old_path)
+            new_name = _basename(p)
+            if old_name != new_name:
+                changed_props["[Name]"] = (old_name, new_name)
+            if old_props.get("__parent_id__", "") != new_props.get("__parent_id__", ""):
+                changed_props["[Parent]"] = (_parent_path(old_path), _parent_path(p))
 
         if added_props or removed_props or changed_props:
             modified_nodes[p] = {
@@ -359,6 +449,7 @@ def diff_prefab(old_nodes: OrderedDict, new_nodes: OrderedDict) -> dict:
         "added_nodes": added_nodes,
         "removed_nodes": removed_nodes,
         "modified_nodes": modified_nodes,
+        "renamed_paths": renamed_paths,
     }
 
 

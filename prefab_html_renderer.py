@@ -91,6 +91,10 @@ def build_prefab_report_data(filename, diff_result, old_nodes=None, new_nodes=No
     diff_result = diff_result or {}
     old_nodes = old_nodes or {}
     new_nodes = new_nodes or {}
+    renamed_paths = {
+        str(old_path): str(new_path)
+        for old_path, new_path in (diff_result.get("renamed_paths") or {}).items()
+    }
 
     added = [_node_payload(path, props, "added") for path, props in diff_result.get("added_nodes", {}).items()]
     removed = [_node_payload(path, props, "removed") for path, props in diff_result.get("removed_nodes", {}).items()]
@@ -101,8 +105,9 @@ def build_prefab_report_data(filename, diff_result, old_nodes=None, new_nodes=No
         "added": added,
         "removed": removed,
         "modified": modified,
-        "oldPaths": [str(path) for path in old_nodes.keys()],
+        "oldPaths": [str(path) for path in old_nodes.keys() if str(path) not in renamed_paths],
         "newPaths": [str(path) for path in new_nodes.keys()],
+        "renamedPaths": [{"old": old_path, "new": new_path} for old_path, new_path in renamed_paths.items()],
         "counts": {
             "addedNodes": len(added),
             "removedNodes": len(removed),

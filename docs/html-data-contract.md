@@ -22,6 +22,7 @@ HTML 模板拿到的是 `window.PREFAB_DIFF_DATA`，其中：
 - `reports[].added[]` / `removed[]`：新增、删除节点。
 - `reports[].modified[]`：属性变更节点。
 - `oldPaths` / `newPaths`：旧版、新版完整节点路径列表。
+- `renamedPaths[]`：通过内部节点身份匹配到的路径变更，形如 `{"old": "...", "new": "..."}`。
 
 节点和属性值最终都是字符串。HTML 可以做展示增强，但不应把它们当作原始 YAML 重新解析。
 
@@ -78,6 +79,33 @@ HTML 当前用第一个 `.` 拆分组件名和字段名。例如：
 - `LocalizeProperty.m_records[RectTransform.anchoredPosition].m_pairs[kr]`
 
 以下 key 是特殊约定。
+
+### `__id__` / `__parent_id__`
+
+这两个字段是 textconv 生成的内部节点身份元数据，不是 Unity YAML 原始字段。
+
+```text
+__id__: go:123456
+__parent_id__: go:654321
+```
+
+用途：
+
+- `__id__` 用于在节点改名后继续识别同一个节点，避免误报为删除旧节点、新增新节点。
+- `__parent_id__` 用于识别同名节点被移动到其它父节点的情况。
+- 默认 HTML 会过滤这两个字段，不把它们渲染到 `Properties` 组。
+
+当只有节点名字变化时，diff 会生成：
+
+```text
+[Name]: OldName -> NewName
+```
+
+当同名节点父级发生变化时，diff 会生成：
+
+```text
+[Parent]: OldParentPath -> NewParentPath
+```
 
 ### `__flags__`
 

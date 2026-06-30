@@ -1379,7 +1379,7 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def _format_rgba_color(channels):
+def _format_rgba_color(channels, _order='rgba'):
     numeric = {channel: _parse_float_text(channels.get(channel, '')) for channel in 'rgba'}
     if any(numeric[channel] is None for channel in 'rgba'):
         return ''
@@ -2255,6 +2255,22 @@ def convert(content):
             return ''
         return '/'.join(parts[1:])
 
+    def _go_identity_for_tfm(tfm_fid):
+        go_fid = tfm_go.get(tfm_fid or '')
+        return f'go:{go_fid}' if go_fid else ''
+
+    def _parent_identity_for_tfm(tfm_fid):
+        return _go_identity_for_tfm(tfm_par.get(tfm_fid or ''))
+
+    def _emit_node_header(path, flags=None, node_id='', parent_id=''):
+        flags = flags or []
+        flag_str = f'  [{", ".join(flags)}]' if flags else ''
+        lines.append(f'[{path}]{flag_str}')
+        if node_id:
+            lines.append(f'  __id__: {node_id}')
+        if parent_id:
+            lines.append(f'  __parent_id__: {parent_id}')
+
     def render_node(tfm_fid, path_prefix):
         go_fid = tfm_go.get(tfm_fid)
         if not go_fid:
@@ -2271,8 +2287,7 @@ def convert(content):
             flags.append('Inactive')
         if tag and tag not in ('Untagged', ''):
             flags.append(f'tag:{tag}')
-        flag_str = f'  [{", ".join(flags)}]' if flags else ''
-        lines.append(f'[{path}]{flag_str}')
+        _emit_node_header(path, flags, f'go:{go_fid}', _parent_identity_for_tfm(tfm_fid))
         rendered_paths.add(path)
         rendered_go_fids.add(go_fid)
         rendered_tfm_fids.add(tfm_fid)
@@ -2306,7 +2321,7 @@ def convert(content):
 
     def render_pi_node(pi_fid, path_prefix):
         """Render a PrefabInstance + its overrides in flat format."""
-        src_guid, _parent_fid, body = pi_info[pi_fid]
+        src_guid, parent_fid, body = pi_info[pi_fid]
         src_name = prefab_label(src_guid)
 
         mods = normalize_prefab_instance_mods(parse_prefab_instance_mods(body), src_guid)
@@ -2317,7 +2332,7 @@ def convert(content):
         else:
             node_label = src_name
         path = f'{path_prefix}/{node_label}' if path_prefix else node_label
-        lines.append(f'[{path}] [Prefab]')
+        _emit_node_header(path, ['Prefab'], f'prefab:{pi_fid}', _go_identity_for_tfm(parent_fid))
         rendered_paths.add(path)
         pi_render_path[pi_fid] = path
 
@@ -2347,7 +2362,8 @@ def convert(content):
                 if relative_path:
                     target_path = f'{path}/{relative_path}'
                     comp = prefab_target_component(target_guid, tfid) or 'PrefabOverride'
-                    by_target_path.setdefault(target_path, []).append((comp, prop, val))
+                    target_id = f'prefab:{pi_fid}:target:{target_guid}:{tfid}'
+                    by_target_path.setdefault(target_path, []).append((target_id, comp, prop, val))
                 else:
                     fallback_by_target.setdefault(tfid, (target_guid, []))[1].append((prop, val))
 
@@ -2360,16 +2376,18 @@ def convert(content):
                         target_path = f'{path}/{relative_path}' if relative_path else path
                         comp = component or 'PrefabOverride'
                         for prop, val in prop_list:
-                            by_target_path.setdefault(target_path, []).append((comp, prop, val))
+                            target_id = f'prefab:{pi_fid}:target:{target_guid}:{tfid}'
+                            by_target_path.setdefault(target_path, []).append((target_id, comp, prop, val))
                     else:
                         remaining_fallback[tfid] = (target_guid, prop_list)
                 fallback_by_target = remaining_fallback
 
             for target_path, prop_list in by_target_path.items():
                 if target_path != path:
-                    lines.append(f'[{target_path}] [PrefabOverride]')
+                    node_id = prop_list[0][0] if prop_list else ''
+                    _emit_node_header(target_path, ['PrefabOverride'], node_id)
                     rendered_paths.add(target_path)
-                for comp, prop, val in prop_list:
+                for _target_id, comp, prop, val in prop_list:
                     val = translate_fileid_refs(val, _resolve_local_ref)
                     lines.append(f'  {comp}.{prop}: {val}')
 
@@ -2381,7 +2399,8 @@ def convert(content):
                 else:
                     target_path = f'{path}/{obj_name}'
                 comp = prefab_target_component(target_guid, tfid) or 'PrefabOverride'
-                lines.append(f'[{target_path}] [PrefabOverride]')
+                target_id = f'prefab:{pi_fid}:target:{target_guid or src_guid}:{tfid}'
+                _emit_node_header(target_path, ['PrefabOverride'], target_id)
                 rendered_paths.add(target_path)
                 for prop, val in prop_list:
                     val = translate_fileid_refs(val, _resolve_local_ref)
@@ -2448,7 +2467,7 @@ def convert(content):
         if go_fid not in rendered_go_fids:
             orphan_path = _orphan_display_path(go_fid)
             if orphan_path and orphan_path not in rendered_paths:
-                lines.append(f'[{orphan_path}] [Orphan]')
+                _emit_node_header(orphan_path, ['Orphan'], f'go:{go_fid}')
                 rendered_paths.add(orphan_path)
 
     lines = [translate_fileid_refs(line, _resolve_local_ref) for line in lines]
