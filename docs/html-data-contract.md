@@ -155,6 +155,29 @@ HTML 应保持可见，不要过滤。
 
 ## Property Value 特殊格式
 
+### Vector 分量
+
+Unity 常见的向量字段会从独立分量合并成一个字段：
+
+```text
+m_SizeDelta.x: 168
+m_SizeDelta.y: 40
+```
+
+HTML 收到：
+
+```text
+key:   RectTransform.m_SizeDelta
+value: {x: 168, y: 40}
+```
+
+合并规则：
+
+- `x/y` 同时存在时合并为 Vector2 形态。
+- `x/y/z` 同时存在时合并为 Vector3 形态。
+- `x/y/z/w` 同时存在时合并为 Vector4 形态。
+- 只有单个分量变化时保留原字段，例如 `m_SizeDelta.x`。
+
 ### 颜色值
 
 颜色会被格式化成以 `rgba(...)` 开头的字符串。HTML 可以通过 `rgba(...)` 识别并渲染色块。

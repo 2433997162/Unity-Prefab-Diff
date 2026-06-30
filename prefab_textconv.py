@@ -1292,6 +1292,7 @@ FILEID_REF_RE = re.compile(
 )
 UNICODE_ESCAPE_RE = re.compile(r'\\u([0-9a-fA-F]{4})')
 COLOR_CHANNEL_RE = re.compile(r'^(.+)\.([rgba])$')
+VECTOR_CHANNEL_RE = re.compile(r'^(.+)\.([xyzw])$')
 PACKED_RGBA_RE = re.compile(r'^(.+)\.rgba$')
 INLINE_COLOR_OBJECT_RE = re.compile(
     r'^\{\s*r\s*:\s*([^,{}]+)\s*,\s*g\s*:\s*([^,{}]+)\s*,'
@@ -1436,6 +1437,10 @@ def _format_color_prop_pair(key, value):
     return key, _format_inline_color_value(key, value)
 
 
+def _identity_prop_pair(key, value):
+    return key, value
+
+
 def _split_color_channel_key(key):
     match = COLOR_CHANNEL_RE.match(key or '')
     if not match:
@@ -1446,71 +1451,135 @@ def _split_color_channel_key(key):
     return base, channel
 
 
-def _combine_color_prop_pairs(props):
+def _split_vector_channel_key(key):
+    match = VECTOR_CHANNEL_RE.match(key or '')
+    if not match:
+        return '', ''
+    return match.group(1), match.group(2)
+
+
+def _vector_channels_for_group(channels):
+    present = set(channels)
+    if all(channel in present for channel in 'xyzw'):
+        return 'xyzw'
+    if all(channel in present for channel in 'xyz'):
+        return 'xyz'
+    if all(channel in present for channel in 'xy'):
+        return 'xy'
+    return ''
+
+
+def _format_vector_value(channels, order):
+    return '{' + ', '.join(f'{channel}: {channels[channel]}' for channel in order) + '}'
+
+
+def _combine_channel_prop_pairs(props, split_key, required_order, format_value, fallback_pair):
     groups = defaultdict(dict)
     first_index = {}
     for index, (key, value) in enumerate(props):
-        base, channel = _split_color_channel_key(key)
+        base, channel = split_key(key)
         if not base or _parse_float_text(value) is None:
             continue
         groups[base][channel] = (value, index)
         first_index.setdefault(base, index)
 
-    complete = {
-        base: {channel: groups[base][channel][0] for channel in 'rgba'}
-        for base in groups
-        if all(channel in groups[base] for channel in 'rgba')
-    }
+    complete = {}
+    for base, channels in groups.items():
+        order = required_order(channels)
+        if order:
+            complete[base] = (order, {channel: channels[channel][0] for channel in order})
     consumed = {
         groups[base][channel][1]
-        for base in complete
-        for channel in 'rgba'
+        for base, (order, _values) in complete.items()
+        for channel in order
     }
 
     result = []
     for index, (key, value) in enumerate(props):
         if index in consumed:
-            base, _channel = _split_color_channel_key(key)
+            base, _channel = split_key(key)
             if first_index.get(base) == index:
-                result.append((base, _format_rgba_color(complete[base])))
+                order, values = complete[base]
+                result.append((base, format_value(values, order)))
             continue
-        result.append(_format_color_prop_pair(key, value))
+        result.append(fallback_pair(key, value))
     return result
 
 
-def _combine_color_mods(mods):
+def _combine_color_prop_pairs(props):
+    return _combine_channel_prop_pairs(
+        props,
+        _split_color_channel_key,
+        lambda channels: 'rgba' if all(channel in channels for channel in 'rgba') else '',
+        _format_rgba_color,
+        _format_color_prop_pair,
+    )
+
+
+def _combine_vector_prop_pairs(props):
+    return _combine_channel_prop_pairs(
+        props,
+        _split_vector_channel_key,
+        _vector_channels_for_group,
+        _format_vector_value,
+        _identity_prop_pair,
+    )
+
+
+def _combine_channel_mods(mods, split_key, required_order, format_value, fallback_pair):
     groups = defaultdict(dict)
     first_index = {}
     for index, (tfid, tguid, prop, value) in enumerate(mods):
-        base, channel = _split_color_channel_key(prop)
+        base, channel = split_key(prop)
         if not base or _parse_float_text(value) is None:
             continue
         group_key = (tfid, tguid, base)
         groups[group_key][channel] = (value, index)
         first_index.setdefault(group_key, index)
 
-    complete = {
-        group_key: {channel: groups[group_key][channel][0] for channel in 'rgba'}
-        for group_key in groups
-        if all(channel in groups[group_key] for channel in 'rgba')
-    }
+    complete = {}
+    for group_key, channels in groups.items():
+        order = required_order(channels)
+        if order:
+            complete[group_key] = (order, {channel: channels[channel][0] for channel in order})
     consumed = {
         groups[group_key][channel][1]
-        for group_key in complete
-        for channel in 'rgba'
+        for group_key, (order, _values) in complete.items()
+        for channel in order
     }
 
     result = []
     for index, (tfid, tguid, prop, value) in enumerate(mods):
         if index in consumed:
-            base, _channel = _split_color_channel_key(prop)
+            base, _channel = split_key(prop)
             group_key = (tfid, tguid, base)
             if first_index.get(group_key) == index:
-                result.append((tfid, tguid, base, _format_rgba_color(complete[group_key])))
+                order, values = complete[group_key]
+                result.append((tfid, tguid, base, format_value(values, order)))
             continue
-        formatted_key, formatted_value = _format_color_prop_pair(prop, value)
+        formatted_key, formatted_value = fallback_pair(prop, value)
         result.append((tfid, tguid, formatted_key, formatted_value))
     return result
+
+
+def _combine_color_mods(mods):
+    return _combine_channel_mods(
+        mods,
+        _split_color_channel_key,
+        lambda channels: 'rgba' if all(channel in channels for channel in 'rgba') else '',
+        _format_rgba_color,
+        _format_color_prop_pair,
+    )
+
+
+def _combine_vector_mods(mods):
+    return _combine_channel_mods(
+        mods,
+        _split_vector_channel_key,
+        _vector_channels_for_group,
+        _format_vector_value,
+        _identity_prop_pair,
+    )
 
 
 def _indent_len(line):
@@ -1895,7 +1964,7 @@ def extract_props(body, ref_resolver=None):
         if key and val is not None:
             props.append((key, val))
         idx += 1
-    return _combine_color_prop_pairs(props)
+    return _combine_vector_prop_pairs(_combine_color_prop_pairs(props))
 
 
 def parse_prefab_instance_mods(body):
@@ -2037,7 +2106,7 @@ def normalize_prefab_instance_mods(mods, source_guid=''):
             normalized.append((tfid, tguid, _record_override_key(target_guid, tfid, prop, value, record_pair_keys), value))
             continue
         normalized.append((tfid, tguid, prop, value))
-    return _combine_color_mods(normalized)
+    return _combine_vector_mods(_combine_color_mods(normalized))
 
 
 def main():
