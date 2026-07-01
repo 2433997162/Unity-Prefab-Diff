@@ -1,14 +1,14 @@
 # HTML Data Contract
 
 本文档说明 `prefab_diff_template.html` 收到的数据结构，以及在进入 HTML 前已经由
-`prefab_textconv.py` / `prefab_fork_diff.py` 特殊处理过的字段。以后只改 HTML 样式或交互时，应优先参考这里的契约，不要假设字段仍然等同于 Unity 原始 YAML。
+`prefab_textconv.py` / `prefab_diff.py` 特殊处理过的字段。以后只改 HTML 样式或交互时，应优先参考这里的契约，不要假设字段仍然等同于 Unity 原始 YAML。
 
 ## 数据流
 
 ```text
 Unity YAML
   -> prefab_textconv.py      解析、归一化、语义化
-  -> prefab_fork_diff.py     转成节点属性表并计算差异
+  -> prefab_diff.py          转成节点属性表并计算差异
   -> prefab_html_renderer.py 注入 JSON 到 HTML 模板
   -> prefab_diff_template.html
 ```

@@ -2,10 +2,11 @@
 setlocal
 
 set "SCRIPT_DIR=%~dp0"
+set "TOOL_DIR=%SCRIPT_DIR%..\..\"
 if defined PYTHON (
-    "%PYTHON%" "%SCRIPT_DIR%configure_sourcegit_prefab_diff.py" "%SCRIPT_DIR%"
+    "%PYTHON%" "%SCRIPT_DIR%configure_sourcegit_prefab_diff.py" "%TOOL_DIR%"
 ) else (
-    python "%SCRIPT_DIR%configure_sourcegit_prefab_diff.py" "%SCRIPT_DIR%"
+    python "%SCRIPT_DIR%configure_sourcegit_prefab_diff.py" "%TOOL_DIR%"
 )
 set "EXIT_CODE=%ERRORLEVEL%"
 

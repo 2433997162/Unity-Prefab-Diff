@@ -13,6 +13,10 @@ SOURCEGIT_ARGS = (
 )
 
 
+def _default_tool_dir() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
 def _preference_path() -> Path:
     appdata = os.environ.get("APPDATA") or ""
     if not appdata:
@@ -26,7 +30,7 @@ def _find_renderer(renderers):
             return renderer
     for renderer in renderers:
         executable = str(renderer.get("Executable") or "").replace("\\", "/").lower()
-        if executable.endswith("/fork_diff.cmd") or executable.endswith("/prefab_fork_diff.py"):
+        if executable.endswith("/prefab_diff.cmd") or executable.endswith("/prefab_diff.py"):
             return renderer
     return None
 
@@ -36,9 +40,9 @@ def configure(tool_dir: Path):
     if not preference_path.exists():
         raise RuntimeError(f"SourceGit preference file not found: {preference_path}")
 
-    executable = (tool_dir / "fork_diff.cmd").resolve()
+    executable = (tool_dir / "prefab_diff.cmd").resolve()
     if not executable.exists():
-        raise RuntimeError(f"fork_diff.cmd not found: {executable}")
+        raise RuntimeError(f"prefab_diff.cmd not found: {executable}")
 
     backup_path = preference_path.with_name(
         preference_path.name + f".bak-{datetime.now():%Y%m%d-%H%M%S}-prefab-diff"
@@ -79,7 +83,7 @@ def configure(tool_dir: Path):
 
 
 def main(argv):
-    tool_dir = Path(argv[1]).resolve() if len(argv) > 1 else Path(__file__).resolve().parent
+    tool_dir = Path(argv[1]).resolve() if len(argv) > 1 else _default_tool_dir()
     configure(tool_dir)
 
 

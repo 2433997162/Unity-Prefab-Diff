@@ -27,7 +27,7 @@ else:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prefab_html_renderer import generate_prefab_collection_html
-from prefab_fork_diff import convert_to_structured, parse_structured_text, diff_prefab
+from prefab_diff import convert_to_structured, parse_structured_text, diff_prefab
 
 
 _cat_file_proc = None
