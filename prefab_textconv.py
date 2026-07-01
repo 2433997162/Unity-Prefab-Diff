@@ -17,6 +17,9 @@ import tempfile
 import subprocess
 import atexit
 import difflib
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from collections import defaultdict
 
 # ── Type ID map (from prefab_to_md.py CLASS_NAMES — authoritative source) ────
@@ -88,19 +91,24 @@ DOC_RE = re.compile(r'^--- !u!(\d+) &(\d+)', re.MULTILINE)
 
 # ── GUID → 脚本类名缓存（与 analyze-prefab/prefab_to_md.py 逻辑一致）──────────
 _guid_cache: dict = {}        # full_guid → class_name (from .cs.meta)
+_asset_guid_cache: dict = {}  # full_guid → absolute asset path (only cheap known assets)
 _prefab_guid_cache: dict = {} # full_guid → absolute path (from .prefab.meta)
 _cache_project_root: str = ''
 _asset_resolver = None
 _git_asset_content_cache: dict = {}  # (git_cache_key, asset_path) -> content
 _git_guid_asset_path_cache: dict = {} # (git_cache_key, guid) -> asset path
+_git_guid_prefab_path_cache: dict = {} # (git_cache_key, guid) -> prefab asset path
 _git_prefab_label_cache: dict = {}    # (git_cache_key, guid) -> label
 _git_cat_file_procs: dict = {}        # normcase(project_root) -> Popen
 _git_prefab_history_cache: dict = {}  # (git_cache_key, guid) -> [(rev, sections)]
+_git_prefab_history_rev_cache: dict = {}  # (git_cache_key, asset_path, max_count) -> [rev]
 _git_fileid_asset_cache: dict = {}    # (git_cache_key, hint_dir, fid) -> [asset_path]
 _git_direct_prefab_index_cache: dict = {}  # (git_cache_key, asset_path) -> (names, paths, components)
+_git_history_direct_prefab_index_cache: dict = {}  # (git_cache_key, rev, asset_path) -> (names, paths, components)
 _prefab_property_target_hints: dict = {}  # (cache_key, guid, props) -> (path, component)
+_resolve_caches: dict = {}  # git_cache_key -> ResolveCache
 
-_CACHE_VERSION = 4
+_CACHE_VERSION = 6
 _CACHE_TTL = 6 * 3600  # 6 hours
 _SKIP_DIRS = frozenset({'Library', 'Temp', 'Build', 'Logs', 'obj', '.git'})
 _TOOL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -110,6 +118,79 @@ _TMP_EFFECT_PROPS = frozenset({
     'outlineSoftness', 'glowColor', 'glowOffset', 'glowInner', 'glowOuter',
     'glowPower',
 })
+
+
+@dataclass
+class TargetInfo:
+    name: str = ''
+    path: str = ''
+    component: str = ''
+    source_kind: str = ''
+    source_rev: str = ''
+    source_asset_path: str = ''
+
+
+@dataclass
+class PrefabIndex:
+    names: dict = field(default_factory=dict)
+    paths: dict = field(default_factory=dict)
+    components: dict = field(default_factory=dict)
+    nested_prefab_guids: set = field(default_factory=set)
+    nested_instances: list = field(default_factory=list)
+    override_targets: set = field(default_factory=set)
+
+
+class ResolveCache:
+    def __init__(self):
+        self.prefab_index_by_guid = {}
+        self.target_by_fileid = {}
+        self.history_target_by_fileid = {}
+        self.history_target_not_found = set()
+        self.history_target_partial = set()
+        self.visited_assets = set()
+        self.visited_targets = set()
+
+    @staticmethod
+    def target_key(guid: str, fid: str):
+        return (guid or '', str(fid or ''))
+
+    def get_history_target(self, guid: str, fid: str):
+        return self.history_target_by_fileid.get(self.target_key(guid, fid))
+
+    def get_target(self, guid: str, fid: str):
+        return self.target_by_fileid.get(self.target_key(guid, fid))
+
+    def set_target(self, guid: str, fid: str, target: TargetInfo):
+        self.target_by_fileid[self.target_key(guid, fid)] = target
+
+    def set_history_target(self, guid: str, fid: str, target: TargetInfo):
+        key = self.target_key(guid, fid)
+        self.history_target_by_fileid[key] = target
+        self.history_target_not_found.discard(key)
+        self.history_target_partial.discard(key)
+
+    def mark_history_not_found(self, guid: str, fid: str):
+        key = self.target_key(guid, fid)
+        if key not in self.history_target_by_fileid:
+            self.history_target_not_found.add(key)
+
+    def is_history_not_found(self, guid: str, fid: str) -> bool:
+        return self.target_key(guid, fid) in self.history_target_not_found
+
+    def is_history_partial(self, guid: str, fid: str) -> bool:
+        return self.target_key(guid, fid) in self.history_target_partial
+
+    def mark_history_partial(self, guid: str, fid: str):
+        key = self.target_key(guid, fid)
+        if key not in self.history_target_by_fileid:
+            self.history_target_partial.add(key)
+
+    def mark_asset_visited(self, guid: str) -> bool:
+        guid = guid or ''
+        if not guid or guid in self.visited_assets:
+            return False
+        self.visited_assets.add(guid)
+        return True
 
 
 def _close_git_cat_file_procs():
@@ -181,29 +262,59 @@ def _read_git_blob(project_root: str, object_spec: str) -> str:
 
 
 class GitTreeAssetResolver:
-    def __init__(self, project_root: str, rev: str):
+    def __init__(self, project_root: str, rev: str, use_batch_reader: bool = True):
         self.project_root = os.path.abspath(project_root)
         self.rev = rev
         self.cache_key = f'git:{os.path.normcase(self.project_root)}:{rev}'
+        self.use_batch_reader = use_batch_reader
         self._guid_asset_path = {}
         self._guid_sections = {}
         self._guid_history_sections = {}
         self._guid_label = {}
+        self.resolve_cache = _resolve_caches.setdefault(self.cache_key, ResolveCache())
         self.lookup_count = 0
-        self.max_lookups = int(os.environ.get('PREFAB_DIFF_MAX_GIT_LOOKUPS', '2') or '2')
+        self.max_lookups = _int_env('PREFAB_DIFF_MAX_GIT_LOOKUPS', 2)
         self.history_lookup_count = 0
-        self.max_history_assets = int(os.environ.get('PREFAB_DIFF_MAX_HISTORY_ASSETS', '8') or '8')
-        self.history_revs = int(os.environ.get('PREFAB_DIFF_HISTORY_REVS', '64') or '64')
+        self.max_history_assets = _int_env('PREFAB_DIFF_MAX_HISTORY_ASSETS', 8)
+        self.history_revs = _int_env('PREFAB_DIFF_HISTORY_REVS', 64)
         self.fileid_lookup_count = 0
-        self.max_fileid_lookups = int(os.environ.get('PREFAB_DIFF_MAX_FILEID_LOOKUPS', '32') or '32')
+        self.max_fileid_lookups = _int_env('PREFAB_DIFF_MAX_FILEID_LOOKUPS', 32)
+        self.max_resolve_depth = _int_env('PREFAB_DIFF_MAX_RESOLVE_DEPTH', 0)
+        self._budget_owner = self
+        self._budget_lock = threading.Lock()
+
+    def fork_for_worker(self):
+        worker = GitTreeAssetResolver(self.project_root, self.rev, use_batch_reader=False)
+        worker.resolve_cache = self.resolve_cache
+        worker._budget_owner = self._budget_owner
+        worker._budget_lock = self._budget_lock
+        return worker
+
+    def _consume_budget(self, counter_name: str, max_name: str) -> bool:
+        owner = self._budget_owner
+        with owner._budget_lock:
+            if getattr(owner, counter_name) >= getattr(owner, max_name):
+                return False
+            setattr(owner, counter_name, getattr(owner, counter_name) + 1)
+            return True
+
+    def _read_blob(self, object_spec: str) -> str:
+        if self.use_batch_reader:
+            content = _read_git_blob(self.project_root, object_spec)
+            if content:
+                return content
+        return self._run_git(['show', object_spec])
 
     def _run_git(self, args):
-        result = subprocess.run(
-            ['git', '-C', self.project_root, '--no-pager'] + args,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            text=True, encoding='utf-8', errors='replace'
-        )
+        try:
+            result = subprocess.run(
+                ['git', '-C', self.project_root, '--no-pager'] + args,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True, encoding='utf-8', errors='replace'
+            )
+        except OSError:
+            return ''
         if result.returncode != 0:
             return ''
         return result.stdout
@@ -216,10 +327,9 @@ class GitTreeAssetResolver:
             asset_path = _git_guid_asset_path_cache[cache_key]
             self._guid_asset_path[guid] = asset_path
             return asset_path
-        if self.lookup_count >= self.max_lookups:
+        if not self._consume_budget('lookup_count', 'max_lookups'):
             self._guid_asset_path[guid] = ''
             return ''
-        self.lookup_count += 1
         output = self._run_git([
             'grep', '-I', '-l', '--fixed-strings', f'guid: {guid}',
             self.rev, '--', ':(glob)Assets/**/*.meta'
@@ -238,6 +348,16 @@ class GitTreeAssetResolver:
         return asset_path
 
     def asset_path_from_disk_cache(self, guid: str) -> str:
+        path = _asset_guid_cache.get(guid, '') or _prefab_guid_cache.get(guid, '')
+        if not path:
+            return ''
+        try:
+            rel = os.path.relpath(path, self.project_root).replace('\\', '/')
+        except ValueError:
+            return ''
+        return rel if not rel.startswith('..') else ''
+
+    def prefab_path_from_disk_cache(self, guid: str) -> str:
         path = _prefab_guid_cache.get(guid, '')
         if not path:
             return ''
@@ -247,14 +367,38 @@ class GitTreeAssetResolver:
             return ''
         return rel if not rel.startswith('..') else ''
 
+    def find_prefab_asset_path(self, guid: str) -> str:
+        cache_key = (self.cache_key, guid)
+        if cache_key in _git_guid_prefab_path_cache:
+            return _git_guid_prefab_path_cache[cache_key]
+        if not self._consume_budget('lookup_count', 'max_lookups'):
+            _git_guid_prefab_path_cache[cache_key] = ''
+            return ''
+        output = self._run_git([
+            'grep', '-I', '-l', '--fixed-strings', f'guid: {guid}',
+            self.rev, '--', ':(glob)Assets/**/*.prefab.meta'
+        ])
+        asset_path = ''
+        for line in output.splitlines():
+            path = line.split(':', 1)[1] if ':' in line else line
+            path = path.replace('\\', '/')
+            if path.startswith('./'):
+                path = path[2:]
+            if path.endswith('.prefab.meta'):
+                asset_path = path[:-5]
+                break
+        _git_guid_prefab_path_cache[cache_key] = asset_path
+        return asset_path
+
+    def asset_path_for_prefab_guid(self, guid: str) -> str:
+        return self.prefab_path_from_disk_cache(guid) or self.find_prefab_asset_path(guid)
+
     def read_asset(self, asset_path: str) -> str:
         asset_path = asset_path.replace('\\', '/')
         cache_key = (self.cache_key, asset_path)
         if cache_key in _git_asset_content_cache:
             return _git_asset_content_cache[cache_key]
-        content = _read_git_blob(self.project_root, f'{self.rev}:./{asset_path}')
-        if not content:
-            content = self._run_git(['show', f'{self.rev}:./{asset_path}'])
+        content = self._read_blob(f'{self.rev}:./{asset_path}')
         _git_asset_content_cache[cache_key] = content
         return content
 
@@ -269,7 +413,7 @@ class GitTreeAssetResolver:
             label = _git_prefab_label_cache[cache_key]
             self._guid_label[guid] = label
             return label
-        asset_path = self.find_asset_path(guid)
+        asset_path = self.asset_path_for_prefab_guid(guid)
         label = os.path.basename(asset_path) if asset_path else ''
         self._guid_label[guid] = label
         _git_prefab_label_cache[cache_key] = label
@@ -278,7 +422,7 @@ class GitTreeAssetResolver:
     def prefab_sections(self, guid: str):
         if guid in self._guid_sections:
             return self._guid_sections[guid]
-        asset_path = self.asset_path_for_guid(guid)
+        asset_path = self.asset_path_for_prefab_guid(guid)
         if not asset_path or not asset_path.endswith('.prefab'):
             self._guid_sections[guid] = []
             return []
@@ -286,6 +430,159 @@ class GitTreeAssetResolver:
         sections = _parse_prefab_sections_from_content(content) if content else []
         self._guid_sections[guid] = sections
         return sections
+
+    def prefab_index(self, guid: str):
+        guid = guid or ''
+        if not guid:
+            return PrefabIndex()
+        if guid in self.resolve_cache.prefab_index_by_guid:
+            return self.resolve_cache.prefab_index_by_guid[guid]
+        sections = self.prefab_sections(guid)
+        if sections:
+            names, paths = _build_prefab_go_index(guid, use_resolver=True)
+            components = dict(_prefab_component_names.get(_prefab_name_cache_key(guid, True), {}))
+            nested_prefab_guids, nested_instances, override_targets = _collect_prefab_dependency_details(sections)
+            index = PrefabIndex(
+                names=dict(names),
+                paths=dict(paths),
+                components=components,
+                nested_prefab_guids=nested_prefab_guids,
+                nested_instances=nested_instances,
+                override_targets=override_targets,
+            )
+        else:
+            index = PrefabIndex()
+        self.resolve_cache.prefab_index_by_guid[guid] = index
+        asset_path = self.asset_path_for_prefab_guid(guid)
+        for fid in set(index.names) | set(index.paths) | set(index.components):
+            self.resolve_cache.set_target(guid, fid, TargetInfo(
+                name=index.names.get(fid, ''),
+                path=index.paths.get(fid, ''),
+                component=index.components.get(fid, ''),
+                source_kind='current',
+                source_rev=self.rev,
+                source_asset_path=asset_path,
+            ))
+        return index
+
+    def _history_revs_for_asset(self, asset_path: str):
+        cache_key = (self.cache_key, asset_path, self.history_revs)
+        if cache_key in _git_prefab_history_rev_cache:
+            return _git_prefab_history_rev_cache[cache_key]
+        output = self._run_git([
+            'rev-list', f'--max-count={self.history_revs}', self.rev,
+            '--', f'./{asset_path}'
+        ])
+        revs = []
+        seen_revs = set()
+        for rev in output.splitlines():
+            rev = rev.strip()
+            if not rev or rev in seen_revs:
+                continue
+            seen_revs.add(rev)
+            revs.append(rev)
+        _git_prefab_history_rev_cache[cache_key] = revs
+        return revs
+
+    def _history_revs_for_assets(self, asset_paths):
+        asset_paths = list(dict.fromkeys(path for path in asset_paths if path))
+        result = {}
+        missing = []
+        for asset_path in asset_paths:
+            cache_key = (self.cache_key, asset_path, self.history_revs)
+            if cache_key in _git_prefab_history_rev_cache:
+                result[asset_path] = _git_prefab_history_rev_cache[cache_key]
+            else:
+                missing.append(asset_path)
+        if not missing:
+            return result
+
+        max_count = max(1, self.history_revs * len(missing))
+        args = ['log', f'--max-count={max_count}', '--format=commit:%H', '--name-only', self.rev, '--']
+        args.extend(f'./{path}' for path in missing)
+        output = self._run_git(args)
+
+        wanted = {path.replace('\\', '/').lstrip('./'): path for path in missing}
+        revs_by_asset = {path: [] for path in missing}
+        seen_by_asset = {path: set() for path in missing}
+        current_rev = ''
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith('commit:'):
+                current_rev = line.split(':', 1)[1].strip()
+                continue
+            path = line.replace('\\', '/').lstrip('./')
+            asset_path = wanted.get(path)
+            if not asset_path or not current_rev:
+                continue
+            if len(revs_by_asset[asset_path]) >= self.history_revs:
+                continue
+            if current_rev in seen_by_asset[asset_path]:
+                continue
+            seen_by_asset[asset_path].add(current_rev)
+            revs_by_asset[asset_path].append(current_rev)
+
+        for asset_path, revs in revs_by_asset.items():
+            _git_prefab_history_rev_cache[(self.cache_key, asset_path, self.history_revs)] = revs
+            result[asset_path] = revs
+        return result
+
+    def _direct_history_index(self, rev: str, asset_path: str):
+        cache_key = (self.cache_key, rev, asset_path)
+        if cache_key in _git_history_direct_prefab_index_cache:
+            return _git_history_direct_prefab_index_cache[cache_key]
+        content = self._read_blob(f'{rev}:./{asset_path}')
+        sections = _parse_prefab_sections_from_content(content) if content else []
+        result = _build_direct_prefab_go_index_from_sections(sections) if sections else ({}, {}, {})
+        _git_history_direct_prefab_index_cache[cache_key] = result
+        return result
+
+    def _pending_history_fids(self, guid: str, fids):
+        pending = []
+        for fid in dict.fromkeys(str(fid) for fid in fids if str(fid)):
+            if self.resolve_cache.get_history_target(guid, fid):
+                continue
+            if self.resolve_cache.is_history_not_found(guid, fid):
+                continue
+            if self.resolve_cache.is_history_partial(guid, fid):
+                continue
+            pending.append(fid)
+        return pending
+
+    def _fill_history_targets_from_revs(self, guid: str, pending, asset_path: str, history_revs):
+        if not history_revs:
+            for fid in pending:
+                self.resolve_cache.mark_history_partial(guid, fid)
+            return
+        missing = set(pending)
+        for rev in history_revs:
+            names, paths, components = self._direct_history_index(rev, asset_path)
+            for fid in list(missing):
+                if fid not in names and fid not in paths and fid not in components:
+                    continue
+                target = TargetInfo(
+                    name=names.get(fid, ''),
+                    path=paths.get(fid, ''),
+                    component=components.get(fid, ''),
+                    source_kind='history',
+                    source_rev=rev,
+                    source_asset_path=asset_path,
+                )
+                self.resolve_cache.set_history_target(guid, fid, target)
+                missing.remove(fid)
+            if not missing:
+                break
+
+        for fid in missing:
+            self.resolve_cache.mark_history_not_found(guid, fid)
+
+    def prefetch_from_root_sections(self, sections):
+        ResolvePlan(self, root_sections=sections, expand_dependencies=True).execute()
+
+    def prefetch_targets_from_sections(self, sections):
+        ResolvePlan(self, root_sections=sections, expand_dependencies=False).execute()
 
     def prefab_history_sections(self, guid: str):
         if guid in self._guid_history_sections:
@@ -295,29 +592,17 @@ class GitTreeAssetResolver:
             sections = _git_prefab_history_cache[cache_key]
             self._guid_history_sections[guid] = sections
             return sections
-        if self.history_revs <= 1 or self.history_lookup_count >= self.max_history_assets:
+        if self.history_revs <= 1 or not self._consume_budget('history_lookup_count', 'max_history_assets'):
             self._guid_history_sections[guid] = []
             return []
-        asset_path = self.asset_path_for_guid(guid)
+        asset_path = self.asset_path_for_prefab_guid(guid)
         if not asset_path or not asset_path.endswith('.prefab'):
             self._guid_history_sections[guid] = []
             return []
 
-        self.history_lookup_count += 1
-        output = self._run_git([
-            'rev-list', f'--max-count={self.history_revs}', self.rev,
-            '--', f'./{asset_path}'
-        ])
         history = []
-        seen_revs = set()
-        for rev in output.splitlines():
-            rev = rev.strip()
-            if not rev or rev in seen_revs:
-                continue
-            seen_revs.add(rev)
-            content = _read_git_blob(self.project_root, f'{rev}:./{asset_path}')
-            if not content:
-                content = self._run_git(['show', f'{rev}:./{asset_path}'])
+        for rev in self._history_revs_for_asset(asset_path):
+            content = self._read_blob(f'{rev}:./{asset_path}')
             sections = _parse_prefab_sections_from_content(content) if content else []
             if sections:
                 history.append((rev, sections))
@@ -326,15 +611,65 @@ class GitTreeAssetResolver:
         _git_prefab_history_cache[cache_key] = history
         return history
 
+    def prefill_history_targets(self, guid: str, fids):
+        pending = self._pending_history_fids(guid, fids)
+        if not pending:
+            return
+        if self.history_revs <= 1 or not self._consume_budget('history_lookup_count', 'max_history_assets'):
+            for fid in pending:
+                self.resolve_cache.mark_history_partial(guid, fid)
+            return
+        asset_path = self.asset_path_for_prefab_guid(guid)
+        if not asset_path or not asset_path.endswith('.prefab'):
+            for fid in pending:
+                self.resolve_cache.mark_history_not_found(guid, fid)
+            return
+
+        history_revs = self._history_revs_for_asset(asset_path)
+        self._fill_history_targets_from_revs(guid, pending, asset_path, history_revs)
+
+    def prefill_history_targets_batch(self, items):
+        entries = []
+        for guid, fids in items:
+            pending = self._pending_history_fids(guid, fids)
+            if not pending:
+                continue
+            if self.history_revs <= 1 or not self._consume_budget('history_lookup_count', 'max_history_assets'):
+                for fid in pending:
+                    self.resolve_cache.mark_history_partial(guid, fid)
+                continue
+            asset_path = self.asset_path_for_prefab_guid(guid)
+            if not asset_path or not asset_path.endswith('.prefab'):
+                for fid in pending:
+                    self.resolve_cache.mark_history_not_found(guid, fid)
+                continue
+            entries.append((guid, pending, asset_path))
+
+        if not entries:
+            return
+        revs_by_asset = self._history_revs_for_assets(asset_path for _guid, _pending, asset_path in entries)
+        for guid, pending, asset_path in entries:
+            self._fill_history_targets_from_revs(
+                guid,
+                pending,
+                asset_path,
+                revs_by_asset.get(asset_path, []),
+            )
+
+    def history_target_info(self, guid: str, fid: str):
+        return self.resolve_cache.get_history_target(guid, fid)
+
+    def target_info(self, guid: str, fid: str):
+        return self.resolve_cache.get_target(guid, fid)
+
     def asset_paths_with_fileid(self, fid: str, hint_dir: str = ''):
         hint_dir = (hint_dir or '').replace('\\', '/').strip('/')
         cache_key = (self.cache_key, hint_dir, fid)
         if cache_key in _git_fileid_asset_cache:
             return _git_fileid_asset_cache[cache_key]
-        if self.fileid_lookup_count >= self.max_fileid_lookups:
+        if not self._consume_budget('fileid_lookup_count', 'max_fileid_lookups'):
             _git_fileid_asset_cache[cache_key] = []
             return []
-        self.fileid_lookup_count += 1
         pathspec = f':(glob){hint_dir}/*.prefab' if hint_dir else ':(glob)Assets/**/*.prefab'
         output = self._run_git([
             'grep', '-I', '-l', '--fixed-strings', f'&{fid}',
@@ -352,25 +687,267 @@ class GitTreeAssetResolver:
         return paths
 
     def asset_paths_with_any_fileid(self, fids, hint_dir: str = ''):
-        fids = [str(fid) for fid in fids if str(fid)]
+        fids = list(dict.fromkeys(str(fid) for fid in fids if str(fid)))
         if not fids:
             return []
         hint_dir = (hint_dir or '').replace('\\', '/').strip('/')
+        cache_key = (self.cache_key, hint_dir, tuple(sorted(set(fids))))
+        if cache_key in _git_fileid_asset_cache:
+            return _git_fileid_asset_cache[cache_key]
+        if self._budget_owner.fileid_lookup_count >= self._budget_owner.max_fileid_lookups:
+            _git_fileid_asset_cache[cache_key] = []
+            return []
         pathspec = f':(glob){hint_dir}/*.prefab' if hint_dir else ':(glob)Assets/**/*.prefab'
-        args = ['grep', '-I', '-l', '--fixed-strings']
-        for fid in fids:
-            args.extend(['-e', f'&{fid}'])
-        args.extend([self.rev, '--', pathspec])
-        output = self._run_git(args)
         paths = []
-        for line in output.splitlines():
-            path = line.split(':', 1)[1] if ':' in line else line
-            path = path.replace('\\', '/')
-            if path.startswith('./'):
-                path = path[2:]
-            if path.endswith('.prefab') and path not in paths:
-                paths.append(path)
+        batch_size = max(1, _int_env('PREFAB_DIFF_FILEID_GREP_BATCH_SIZE', 64))
+        for start in range(0, len(fids), batch_size):
+            if not self._consume_budget('fileid_lookup_count', 'max_fileid_lookups'):
+                break
+            args = ['grep', '-I', '-l', '--fixed-strings']
+            for fid in fids[start:start + batch_size]:
+                args.extend(['-e', f'&{fid}'])
+            args.extend([self.rev, '--', pathspec])
+            output = self._run_git(args)
+            for line in output.splitlines():
+                path = line.split(':', 1)[1] if ':' in line else line
+                path = path.replace('\\', '/')
+                if path.startswith('./'):
+                    path = path[2:]
+                if path.endswith('.prefab') and path not in paths:
+                    paths.append(path)
+        _git_fileid_asset_cache[cache_key] = paths
         return paths
+
+
+class ResolvePlan:
+    def __init__(self, resolver: GitTreeAssetResolver, root_sections=None,
+                 seed_targets=None, expand_dependencies: bool = True,
+                 include_similarity: bool = False,
+                 follow_override_targets: bool = True,
+                 follow_nested_assets: bool = True):
+        self.resolver = resolver
+        self.root_sections = root_sections or []
+        self.expand_dependencies = expand_dependencies
+        self.include_similarity = include_similarity
+        self.follow_override_targets = follow_override_targets
+        self.follow_nested_assets = follow_nested_assets
+        self.max_depth = resolver.max_resolve_depth
+        self.workers = max(1, _int_env('PREFAB_DIFF_RESOLVE_WORKERS', 1))
+        self.max_remap_candidates = max(0, _int_env('PREFAB_DIFF_MAX_REMAP_CANDIDATES', 32))
+        self.remap_history_enabled = os.environ.get('PREFAB_DIFF_REMAP_HISTORY') == '1'
+        self.remap_candidate_count = 0
+        self.pending_guids = set()
+        self.pending_targets = defaultdict(set)
+        self.visited_guids = set()
+        self.visited_targets = set()
+        self.alias_targets = defaultdict(list)
+        self.remap_target_keys = set()
+
+        if self.root_sections:
+            nested_guids, targets = _collect_resolve_dependencies_from_sections(self.root_sections)
+            self.pending_guids.update(nested_guids)
+            for guid, fid in targets:
+                self.pending_targets[guid].add(str(fid))
+
+        if seed_targets:
+            for guid, fids in self._iter_seed_targets(seed_targets):
+                for fid in fids:
+                    self.pending_targets[guid].add(str(fid))
+
+    @staticmethod
+    def _iter_seed_targets(seed_targets):
+        if isinstance(seed_targets, dict):
+            for guid, fids in seed_targets.items():
+                yield guid, fids
+            return
+        for item in seed_targets:
+            if not item:
+                continue
+            guid, fid = item
+            yield guid, [fid]
+
+    def execute(self):
+        depth = 1
+        pending_guids = set(self.pending_guids)
+        pending_targets = defaultdict(set)
+        for guid, fids in self.pending_targets.items():
+            pending_targets[guid].update(fids)
+
+        while pending_guids or pending_targets:
+            layer_guids = {guid for guid in pending_guids if guid and guid not in self.visited_guids}
+            self.visited_guids.update(layer_guids)
+
+            layer_targets = defaultdict(set)
+            for guid, fids in pending_targets.items():
+                if not guid:
+                    continue
+                for fid in fids:
+                    target_key = self.resolver.resolve_cache.target_key(guid, fid)
+                    if target_key in self.visited_targets:
+                        continue
+                    self.visited_targets.add(target_key)
+                    layer_targets[guid].add(str(fid))
+
+            if not layer_guids and not layer_targets:
+                break
+
+            index_guids = layer_guids | set(layer_targets.keys())
+            indices = self._prefetch_indices(index_guids)
+            self._prefill_missing_history(indices, layer_targets)
+            self._propagate_alias_hits(indices)
+            unresolved_targets = self._unresolved_targets(indices, layer_targets)
+            if self.include_similarity:
+                self._prefill_missing_similarity(indices, unresolved_targets)
+
+            if not self.expand_dependencies or (self.max_depth and depth >= self.max_depth):
+                break
+
+            next_guids = set()
+            next_targets = defaultdict(set)
+            for guid, index in indices.items():
+                if self.follow_nested_assets:
+                    next_guids.update(index.nested_prefab_guids)
+                self._queue_nested_remap_targets(guid, index, unresolved_targets.get(guid, ()), next_targets)
+                if self.follow_override_targets:
+                    for target_guid, target_fid in index.override_targets:
+                        next_targets[target_guid].add(str(target_fid))
+
+            depth += 1
+            pending_guids = next_guids
+            pending_targets = next_targets
+
+    def _prefetch_indices(self, guids):
+        indices = {}
+        for guid in sorted(guid for guid in guids if guid):
+            indices[guid] = self.resolver.prefab_index(guid)
+        return indices
+
+    def _target_info(self, guid, fid, indices):
+        target = self.resolver.resolve_cache.get_target(guid, fid)
+        if target:
+            return target
+        index = indices.get(guid) or self.resolver.resolve_cache.prefab_index_by_guid.get(guid)
+        if index and (fid in index.names or fid in index.paths or fid in index.components):
+            return TargetInfo(
+                name=index.names.get(fid, ''),
+                path=index.paths.get(fid, ''),
+                component=index.components.get(fid, ''),
+                source_kind='current',
+                source_rev=self.resolver.rev,
+                source_asset_path=self.resolver.asset_path_for_prefab_guid(guid),
+            )
+        return self.resolver.resolve_cache.get_history_target(guid, fid)
+
+    def _queue_nested_remap_targets(self, guid, index, fids, next_targets):
+        if not fids or not index.nested_instances or self.max_remap_candidates == 0:
+            return
+        for fid in fids:
+            try:
+                remapped_fid = int(fid)
+            except (TypeError, ValueError):
+                continue
+            for pi_fid, nested_guid in index.nested_instances:
+                if self.remap_candidate_count >= self.max_remap_candidates:
+                    return
+                try:
+                    nested_fid = str(remapped_fid ^ int(pi_fid))
+                except (TypeError, ValueError):
+                    continue
+                if not nested_guid or not nested_fid or nested_fid == fid:
+                    continue
+                child_key = self.resolver.resolve_cache.target_key(nested_guid, nested_fid)
+                self.alias_targets[child_key].append((guid, str(fid)))
+                self.remap_target_keys.add(child_key)
+                next_targets[nested_guid].add(nested_fid)
+                self.remap_candidate_count += 1
+
+    def _propagate_alias_hits(self, indices):
+        for child_key, parent_refs in list(self.alias_targets.items()):
+            child_guid, child_fid = child_key
+            child_target = self._target_info(child_guid, child_fid, indices)
+            if not child_target:
+                continue
+            for parent_guid, parent_fid in parent_refs:
+                if self.resolver.resolve_cache.get_target(parent_guid, parent_fid):
+                    continue
+                self.resolver.resolve_cache.set_target(parent_guid, parent_fid, TargetInfo(
+                    name=child_target.name,
+                    path=child_target.path,
+                    component=child_target.component,
+                    source_kind='nested',
+                    source_rev=child_target.source_rev,
+                    source_asset_path=child_target.source_asset_path,
+                ))
+
+    def _missing_targets(self, indices, layer_targets):
+        missing_by_guid = defaultdict(set)
+        for guid, fids in layer_targets.items():
+            index = indices.get(guid) or PrefabIndex()
+            for fid in fids:
+                if (not self.remap_history_enabled and
+                        self.resolver.resolve_cache.target_key(guid, fid) in self.remap_target_keys):
+                    continue
+                if (fid in index.names or fid in index.paths or fid in index.components or
+                        self.resolver.resolve_cache.get_target(guid, fid) or
+                        self.resolver.resolve_cache.get_history_target(guid, fid)):
+                    continue
+                if self.resolver.resolve_cache.is_history_not_found(guid, fid):
+                    continue
+                if self.resolver.resolve_cache.is_history_partial(guid, fid):
+                    continue
+                missing_by_guid[guid].add(str(fid))
+        return missing_by_guid
+
+    def _unresolved_targets(self, indices, layer_targets):
+        unresolved_by_guid = defaultdict(set)
+        for guid, fids in layer_targets.items():
+            index = indices.get(guid) or PrefabIndex()
+            for fid in fids:
+                if (fid in index.names or fid in index.paths or fid in index.components or
+                        self.resolver.resolve_cache.get_target(guid, fid) or
+                        self.resolver.resolve_cache.get_history_target(guid, fid)):
+                    continue
+                unresolved_by_guid[guid].add(str(fid))
+        return unresolved_by_guid
+
+    def _prefill_missing_history(self, indices, layer_targets):
+        missing_by_guid = self._missing_targets(indices, layer_targets)
+        if not missing_by_guid:
+            return
+
+        items = [(guid, sorted(fids)) for guid, fids in sorted(missing_by_guid.items())]
+        if os.environ.get('PREFAB_DIFF_BATCH_HISTORY', '1') != '0' and len(items) > 1:
+            self.resolver.prefill_history_targets_batch(items)
+            return
+
+        if self.workers <= 1 or len(items) <= 1:
+            for guid, fids in items:
+                self.resolver.prefill_history_targets(guid, fids)
+            return
+
+        worker_count = min(self.workers, len(items))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = []
+            for guid, fids in items:
+                worker = self.resolver.fork_for_worker()
+                futures.append(executor.submit(worker.prefill_history_targets, guid, fids))
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    pass
+
+    def _prefill_missing_similarity(self, indices, layer_targets):
+        missing_by_guid = defaultdict(set)
+        for guid, fids in layer_targets.items():
+            index = indices.get(guid) or PrefabIndex()
+            for fid in fids:
+                if (fid in index.names or fid in index.paths or fid in index.components or
+                        self.resolver.resolve_cache.get_history_target(guid, fid)):
+                    continue
+                missing_by_guid[guid].add(str(fid))
+        for guid, fids in missing_by_guid.items():
+            _prefill_similar_prefab_target_hints(guid, fids)
 
 
 def set_git_tree_context(project_root: str, rev: str):
@@ -381,6 +958,14 @@ def set_git_tree_context(project_root: str, rev: str):
 def clear_asset_context():
     global _asset_resolver
     _asset_resolver = None
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
 
 def _read_guid(meta_path: str) -> str:
     """Read GUID from first 'guid:' line of a .meta file (fast, reads minimal bytes)."""
@@ -398,15 +983,19 @@ def _scan_all_meta(scan_dir: str):
             if fname.endswith('.cs.meta'):
                 try:
                     guid = _read_guid(os.path.join(root, fname))
-                    if guid:
-                        _guid_cache[guid] = os.path.splitext(fname[:-5])[0]
+                    if not guid:
+                        continue
+                    _guid_cache[guid] = os.path.splitext(fname[:-5])[0]
                 except Exception:
                     pass
             elif fname.endswith('.prefab.meta'):
                 try:
                     guid = _read_guid(os.path.join(root, fname))
-                    if guid:
-                        _prefab_guid_cache[guid] = os.path.join(root, fname[:-5])
+                    if not guid:
+                        continue
+                    asset_path = os.path.join(root, fname[:-5])
+                    _asset_guid_cache[guid] = asset_path
+                    _prefab_guid_cache[guid] = asset_path
                 except Exception:
                     pass
 
@@ -444,7 +1033,9 @@ def _try_load_disk_cache(project_root: str) -> bool:
         _guid_cache.update(_GUID_FALLBACKS)
         _guid_cache.update(data.get('guid_cache', {}))
         for guid, rel in data.get('prefab_guid_cache', {}).items():
-            _prefab_guid_cache[guid] = os.path.join(project_root, rel)
+            path = os.path.join(project_root, rel)
+            _asset_guid_cache[guid] = path
+            _prefab_guid_cache[guid] = path
         return True
     except Exception:
         return False
@@ -480,6 +1071,7 @@ def build_caches(project_root: str):
         return
     if _cache_project_root and _cache_project_root != project_root:
         _guid_cache.clear()
+        _asset_guid_cache.clear()
         _prefab_guid_cache.clear()
         _prefab_go_names.clear()
         _prefab_go_paths.clear()
@@ -529,6 +1121,12 @@ _prefab_record_metadata = {}  # (context, guid, component fid) → Localize m_re
 def _prefab_name_cache_key(guid: str, use_resolver: bool):
     resolver_key = _asset_resolver.cache_key if use_resolver and _asset_resolver else f'disk:{_cache_project_root}'
     return resolver_key, guid
+
+
+def _prefab_resolve_depth_limit(use_resolver: bool) -> int:
+    if use_resolver and _asset_resolver:
+        return max(0, _asset_resolver.max_resolve_depth)
+    return max(0, _int_env('PREFAB_DIFF_MAX_RESOLVE_DEPTH', 0))
 
 
 def component_name(type_id: int, body: str) -> str:
@@ -581,6 +1179,16 @@ def _prefab_sections_for_guid(guid: str, use_resolver: bool = False):
             return sections
     return []
 
+
+def _iter_prefab_sections(sections):
+    for section in sections:
+        if len(section) == 4:
+            yield section
+        elif len(section) == 3:
+            type_id, fid, body = section
+            yield type_id, fid, body, False
+
+
 def _parse_transform_children(body: str):
     ch_start = body.find('m_Children:')
     if ch_start < 0:
@@ -609,7 +1217,7 @@ def _build_direct_prefab_go_index_from_sections(sections):
     comp_owner = {}
     stripped_src = {}
 
-    for type_id, fid, body, is_stripped in sections:
+    for type_id, fid, body, is_stripped in _iter_prefab_sections(sections):
         if is_stripped:
             src_ref = _source_object_ref(body)
             if src_ref:
@@ -676,6 +1284,55 @@ def _build_direct_prefab_go_index_from_sections(sections):
     return result_names, result_paths, result_component_names
 
 
+def _collect_prefab_dependency_details(sections):
+    nested_prefab_guids = set()
+    nested_instances = []
+    override_targets = set()
+    for type_id, fid, body, is_stripped in _iter_prefab_sections(sections):
+        if is_stripped or type_id != 1001:
+            continue
+        src_m = re.search(r'm_SourcePrefab:.*?guid:\s*([0-9a-f]+)', body)
+        src_guid = src_m.group(1) if src_m else ''
+        if src_guid:
+            nested_prefab_guids.add(src_guid)
+            nested_instances.append((str(fid), src_guid))
+        for target_fid, target_guid, prop, _value in parse_prefab_instance_mods(body):
+            if prop == 'm_Name':
+                continue
+            resolved_guid = target_guid or src_guid
+            if resolved_guid and target_fid:
+                override_targets.add((resolved_guid, str(target_fid)))
+    return nested_prefab_guids, nested_instances, override_targets
+
+
+def _collect_prefab_dependencies_from_sections(sections):
+    nested_prefab_guids, _nested_instances, override_targets = _collect_prefab_dependency_details(sections)
+    return nested_prefab_guids, override_targets
+
+
+def _collect_resolve_dependencies_from_sections(sections):
+    nested_prefab_guids, override_targets = _collect_prefab_dependencies_from_sections(sections)
+    targets = set(override_targets)
+    for _type_id, _fid, body, _is_stripped in _iter_prefab_sections(sections):
+        source_ref = _source_object_ref(body)
+        if source_ref:
+            targets.add((source_ref[1], str(source_ref[0])))
+    return nested_prefab_guids, targets
+
+
+def _build_prefab_index_from_sections(sections):
+    names, paths, components = _build_direct_prefab_go_index_from_sections(sections)
+    nested_prefab_guids, nested_instances, override_targets = _collect_prefab_dependency_details(sections)
+    return PrefabIndex(
+        names=names,
+        paths=paths,
+        components=components,
+        nested_prefab_guids=nested_prefab_guids,
+        nested_instances=nested_instances,
+        override_targets=override_targets,
+    )
+
+
 def _legacy_prefab_index(guid: str):
     if not _asset_resolver:
         return {}, {}, {}
@@ -707,6 +1364,31 @@ def _legacy_prefab_index(guid: str):
     return result_names, result_paths, result_component_names
 
 
+def _cached_legacy_prefab_index(guid: str):
+    if not _asset_resolver:
+        return {}, {}, {}
+    cache_key = (_asset_resolver.cache_key, guid)
+    if (cache_key in _prefab_legacy_go_names and
+            cache_key in _prefab_legacy_go_paths and
+            cache_key in _prefab_legacy_component_names):
+        return (
+            _prefab_legacy_go_names[cache_key],
+            _prefab_legacy_go_paths[cache_key],
+            _prefab_legacy_component_names[cache_key],
+        )
+    return {}, {}, {}
+
+
+def _history_target_or_prefetch(guid: str, fid: str):
+    if not _asset_resolver:
+        return None
+    target = _asset_resolver.history_target_info(guid, fid)
+    if target:
+        return target
+    _asset_resolver.prefill_history_targets(guid, [fid])
+    return _asset_resolver.history_target_info(guid, fid)
+
+
 def _direct_prefab_index_for_asset(asset_path: str):
     if not _asset_resolver:
         return {}, {}, {}
@@ -724,7 +1406,7 @@ def _direct_prefab_index_for_asset(asset_path: str):
 def _fileid_declared_prefab_candidates(fid: str, target_guid: str):
     if not _asset_resolver:
         return []
-    target_asset_path = _asset_resolver.asset_path_for_guid(target_guid)
+    target_asset_path = _asset_resolver.asset_path_for_prefab_guid(target_guid)
     hint_dir = os.path.dirname(target_asset_path).replace('\\', '/') if target_asset_path else ''
     candidates = []
     for asset_path in _asset_resolver.asset_paths_with_fileid(fid, hint_dir):
@@ -778,11 +1460,18 @@ def _target_similarity_index(guid: str):
     target_names = dict(get_prefab_go_names(guid, use_resolver=True))
     target_paths = dict(get_prefab_go_paths(guid, use_resolver=True))
     target_components = dict(get_prefab_component_names(guid, use_resolver=True))
-    legacy_names, legacy_paths, legacy_components = _legacy_prefab_index(guid)
+    if os.environ.get('PREFAB_DIFF_SIMILARITY_HISTORY') == '1':
+        legacy_names, legacy_paths, legacy_components = _legacy_prefab_index(guid)
+    else:
+        legacy_names, legacy_paths, legacy_components = _cached_legacy_prefab_index(guid)
     target_names.update(legacy_names)
     target_paths.update(legacy_paths)
     target_components.update(legacy_components)
     return target_names, target_paths, target_components
+
+
+def _similarity_hints_enabled() -> bool:
+    return os.environ.get('PREFAB_DIFF_SIMILARITY_HINTS') == '1'
 
 
 def _best_similar_target_hint(candidates, target_names, target_paths, target_components):
@@ -824,8 +1513,12 @@ def _prefill_similar_prefab_target_hints(guid: str, fids):
             pending.append(fid)
     if not pending:
         return
+    if not _similarity_hints_enabled():
+        for fid in pending:
+            _prefab_similar_target_hints[(_asset_resolver.cache_key, guid, fid)] = ('', '', '')
+        return
 
-    target_asset_path = _asset_resolver.asset_path_for_guid(guid)
+    target_asset_path = _asset_resolver.asset_path_for_prefab_guid(guid)
     hint_dir = os.path.dirname(target_asset_path).replace('\\', '/') if target_asset_path else ''
     matched_assets = _asset_resolver.asset_paths_with_any_fileid(pending, hint_dir)
     candidates_by_fid = defaultdict(list)
@@ -854,6 +1547,8 @@ def _prefill_similar_prefab_target_hints(guid: str, fids):
 def _similar_prefab_target_hint(guid: str, fid: str):
     if not _asset_resolver:
         return '', '', ''
+    if not _similarity_hints_enabled():
+        return '', '', ''
     cache_key = (_asset_resolver.cache_key, guid, fid)
     if cache_key not in _prefab_similar_target_hints:
         candidates = _fileid_declared_prefab_candidates(fid, guid)
@@ -867,25 +1562,31 @@ def _similar_prefab_target_hint(guid: str, fid: str):
     return _prefab_similar_target_hints[cache_key]
 
 
-def _build_prefab_go_index(guid, _depth=0, use_resolver=False):
+def _build_prefab_go_index(guid, _depth=0, use_resolver=False, _visiting=None):
     """Load fileID→name/path mappings from a source prefab file."""
-    cache_key = _prefab_name_cache_key(guid, use_resolver)
-    if cache_key in _prefab_go_names and cache_key in _prefab_go_paths and cache_key in _prefab_component_names:
-        return _prefab_go_names[cache_key], _prefab_go_paths[cache_key]
-    if _depth > 5:
-        _prefab_go_names[cache_key] = {}
-        _prefab_go_paths[cache_key] = {}
-        _prefab_component_names[cache_key] = {}
+    depth_limit = _prefab_resolve_depth_limit(use_resolver)
+    if depth_limit and _depth > depth_limit:
         return {}, {}
+    visit_key = (_prefab_name_cache_key(guid, use_resolver), guid)
+    visiting = set(_visiting or ())
+    if visit_key in visiting:
+        return {}, {}
+    visiting.add(visit_key)
+
+    cache_key = _prefab_name_cache_key(guid, use_resolver)
+    cache_enabled = True
+    if cache_enabled and cache_key in _prefab_go_names and cache_key in _prefab_go_paths and cache_key in _prefab_component_names:
+        return _prefab_go_names[cache_key], _prefab_go_paths[cache_key]
 
     result_names = {}
     result_paths = {}
     result_component_names = {}
     sections = _prefab_sections_for_guid(guid, use_resolver)
     if not sections:
-        _prefab_go_names[cache_key] = result_names
-        _prefab_go_paths[cache_key] = result_paths
-        _prefab_component_names[cache_key] = result_component_names
+        if cache_enabled:
+            _prefab_go_names[cache_key] = result_names
+            _prefab_go_paths[cache_key] = result_paths
+            _prefab_component_names[cache_key] = result_component_names
         return result_names, result_paths
 
     go_names = {}
@@ -945,7 +1646,7 @@ def _build_prefab_go_index(guid, _depth=0, use_resolver=False):
             result_paths[comp_fid] = result_paths[go_fid]
 
     for fid, (src_fid, src_guid) in stripped_src.items():
-        src_names, src_paths = _build_prefab_go_index(src_guid, _depth + 1, use_resolver)
+        src_names, src_paths = _build_prefab_go_index(src_guid, _depth + 1, use_resolver, visiting)
         src_components = _prefab_component_names.get(_prefab_name_cache_key(src_guid, use_resolver), {})
         if src_fid in src_names:
             result_names[fid] = src_names[src_fid]
@@ -967,7 +1668,7 @@ def _build_prefab_go_index(guid, _depth=0, use_resolver=False):
             pi_fid = int(fid)
         except ValueError:
             continue
-        nested_names, nested_paths = _build_prefab_go_index(nested_guid, _depth + 1, use_resolver)
+        nested_names, nested_paths = _build_prefab_go_index(nested_guid, _depth + 1, use_resolver, visiting)
         nested_components = _prefab_component_names.get(_prefab_name_cache_key(nested_guid, use_resolver), {})
         for nfid_str, nname in nested_names.items():
             try:
@@ -980,9 +1681,10 @@ def _build_prefab_go_index(guid, _depth=0, use_resolver=False):
             if nfid_str in nested_components:
                 result_component_names.setdefault(remapped, nested_components[nfid_str])
 
-    _prefab_go_names[cache_key] = result_names
-    _prefab_go_paths[cache_key] = result_paths
-    _prefab_component_names[cache_key] = result_component_names
+    if cache_enabled:
+        _prefab_go_names[cache_key] = result_names
+        _prefab_go_paths[cache_key] = result_paths
+        _prefab_component_names[cache_key] = result_component_names
     return result_names, result_paths
 
 
@@ -1010,7 +1712,13 @@ def prefab_target_label(guid: str, fid: str) -> str:
         resolver_names = get_prefab_go_names(guid, use_resolver=True)
         if fid in resolver_names:
             return resolver_names[fid]
-        legacy_names, _legacy_paths, _legacy_components = _legacy_prefab_index(guid)
+        planned_target = _asset_resolver.target_info(guid, fid)
+        if planned_target and planned_target.name:
+            return planned_target.name
+        history_target = _history_target_or_prefetch(guid, fid)
+        if history_target and history_target.name:
+            return history_target.name
+        legacy_names, _legacy_paths, _legacy_components = _cached_legacy_prefab_index(guid)
         if fid in legacy_names:
             return legacy_names[fid]
         similar_name, _similar_path, _similar_component = _similar_prefab_target_hint(guid, fid)
@@ -1027,7 +1735,13 @@ def prefab_target_path(guid: str, fid: str) -> str:
         resolver_paths = get_prefab_go_paths(guid, use_resolver=True)
         if fid in resolver_paths:
             return resolver_paths[fid]
-        _legacy_names, legacy_paths, _legacy_components = _legacy_prefab_index(guid)
+        planned_target = _asset_resolver.target_info(guid, fid)
+        if planned_target and planned_target.path:
+            return planned_target.path
+        history_target = _history_target_or_prefetch(guid, fid)
+        if history_target and history_target.path:
+            return history_target.path
+        _legacy_names, legacy_paths, _legacy_components = _cached_legacy_prefab_index(guid)
         if fid in legacy_paths:
             return legacy_paths[fid]
         _similar_name, similar_path, _similar_component = _similar_prefab_target_hint(guid, fid)
@@ -1039,14 +1753,11 @@ def prefab_target_path(guid: str, fid: str) -> str:
     return ''
 
 
-def _prefab_target_path_without_similarity(guid: str, fid: str) -> str:
+def _prefab_target_path_current(guid: str, fid: str) -> str:
     if _asset_resolver:
         resolver_paths = get_prefab_go_paths(guid, use_resolver=True)
         if fid in resolver_paths:
             return resolver_paths[fid]
-        _legacy_names, legacy_paths, _legacy_components = _legacy_prefab_index(guid)
-        if fid in legacy_paths:
-            return legacy_paths[fid]
     paths = get_prefab_go_paths(guid)
     if fid in paths:
         return paths[fid]
@@ -1058,7 +1769,13 @@ def prefab_target_component(guid: str, fid: str) -> str:
         resolver_components = get_prefab_component_names(guid, use_resolver=True)
         if fid in resolver_components:
             return resolver_components[fid]
-        _legacy_names, _legacy_paths, legacy_components = _legacy_prefab_index(guid)
+        planned_target = _asset_resolver.target_info(guid, fid)
+        if planned_target and planned_target.component:
+            return planned_target.component
+        history_target = _history_target_or_prefetch(guid, fid)
+        if history_target and history_target.component:
+            return history_target.component
+        _legacy_names, _legacy_paths, legacy_components = _cached_legacy_prefab_index(guid)
         if fid in legacy_components:
             return legacy_components[fid]
         _similar_name, _similar_path, similar_component = _similar_prefab_target_hint(guid, fid)
@@ -2141,6 +2858,8 @@ def main():
 
 def convert(content):
     sections = parse_all_sections(content)
+    if _asset_resolver and os.environ.get('PREFAB_DIFF_PREFETCH_ROOT_TARGETS') == '1':
+        _asset_resolver.prefetch_targets_from_sections(sections)
     # O(1) lookup: fid → (type_id, body)
     by_fid = {fid: (type_id, body) for type_id, fid, body in sections}
 
@@ -2240,6 +2959,8 @@ def convert(content):
     rendered_go_fids = set()
     rendered_tfm_fids = set()
     pi_render_path = {}
+    pi_raw_mods_cache = {}
+    pi_mods_cache = {}
     ref_labels = {}
 
     def _comp_name(type_id, cbody):
@@ -2270,6 +2991,52 @@ def convert(content):
             lines.append(f'  __id__: {node_id}')
         if parent_id:
             lines.append(f'  __parent_id__: {parent_id}')
+
+    def _raw_mods_for_pi(pi_fid):
+        if pi_fid not in pi_raw_mods_cache:
+            _src_guid, _parent_fid, pi_body = pi_info[pi_fid]
+            pi_raw_mods_cache[pi_fid] = parse_prefab_instance_mods(pi_body)
+        return pi_raw_mods_cache[pi_fid]
+
+    def _mods_for_pi(pi_fid):
+        if pi_fid not in pi_mods_cache:
+            src_guid, _parent_fid, _body = pi_info[pi_fid]
+            pi_mods_cache[pi_fid] = normalize_prefab_instance_mods(_raw_mods_for_pi(pi_fid), src_guid)
+        return pi_mods_cache[pi_fid]
+
+    def _target_known_from_plan(guid, fid):
+        if not _asset_resolver:
+            return False
+        return bool(
+            _asset_resolver.target_info(guid, fid) or
+            _asset_resolver.history_target_info(guid, fid)
+        )
+
+    def _prefetch_all_prefab_override_targets():
+        if not _asset_resolver or not pi_info:
+            return
+        unresolved_by_guid = defaultdict(set)
+        for pi_fid in pi_info:
+            src_guid, _parent_fid, _body = pi_info[pi_fid]
+            for tfid, tguid, prop, _val in _mods_for_pi(pi_fid):
+                if prop == 'm_Name':
+                    continue
+                target_guid = tguid or src_guid
+                if (_prefab_target_path_current(target_guid, tfid) or
+                        _target_known_from_plan(target_guid, tfid)):
+                    continue
+                unresolved_by_guid[target_guid].add(tfid)
+        if unresolved_by_guid:
+            ResolvePlan(
+                _asset_resolver,
+                seed_targets=unresolved_by_guid,
+                expand_dependencies=True,
+                follow_override_targets=False,
+                follow_nested_assets=False,
+            ).execute()
+
+    if os.environ.get('PREFAB_DIFF_PREFETCH_PI_TARGETS', '1') != '0':
+        _prefetch_all_prefab_override_targets()
 
     def render_node(tfm_fid, path_prefix):
         go_fid = tfm_go.get(tfm_fid)
@@ -2324,7 +3091,7 @@ def convert(content):
         src_guid, parent_fid, body = pi_info[pi_fid]
         src_name = prefab_label(src_guid)
 
-        mods = normalize_prefab_instance_mods(parse_prefab_instance_mods(body), src_guid)
+        mods = _mods_for_pi(pi_fid)
         custom_name = next((v for _, _, p, v in mods if p == 'm_Name'), None)
 
         if custom_name:
@@ -2347,13 +3114,27 @@ def convert(content):
             prepared_mods = []
             for tfid, tguid, prop, val in other_mods:
                 target_guid = tguid or src_guid
-                source_path = _prefab_target_path_without_similarity(target_guid, tfid)
-                if not source_path and _asset_resolver:
+                source_path = _prefab_target_path_current(target_guid, tfid)
+                if not source_path and _asset_resolver and not _target_known_from_plan(target_guid, tfid):
                     unresolved_by_guid[target_guid].add(tfid)
                 prepared_mods.append((tfid, target_guid, prop, val, source_path))
 
+            if unresolved_by_guid and _asset_resolver:
+                ResolvePlan(
+                    _asset_resolver,
+                    seed_targets=unresolved_by_guid,
+                    expand_dependencies=True,
+                    follow_override_targets=False,
+                    follow_nested_assets=False,
+                ).execute()
             for target_guid, unresolved_fids in unresolved_by_guid.items():
-                _prefill_similar_prefab_target_hints(target_guid, unresolved_fids)
+                still_unresolved = []
+                for fid in unresolved_fids:
+                    if _asset_resolver and _target_known_from_plan(target_guid, fid):
+                        continue
+                    still_unresolved.append(fid)
+                if still_unresolved:
+                    _prefill_similar_prefab_target_hints(target_guid, still_unresolved)
 
             for tfid, target_guid, prop, val, source_path in prepared_mods:
                 if not source_path:

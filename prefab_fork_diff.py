@@ -17,6 +17,7 @@ import webbrowser
 import subprocess
 import re
 from collections import OrderedDict
+from dataclasses import dataclass
 
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 from prefab_html_renderer import (
@@ -29,6 +30,56 @@ from prefab_html_renderer import (
 _IS_SOURCEGIT_CUSTOM_DIFF = bool(os.environ.get("SOURCEGIT_CUSTOM_DIFF_TEMP"))
 _PROJECT_SEARCH_SKIP = frozenset({"Library", "Temp", "Build", "Builds", "Logs", "obj", ".git", "node_modules"})
 _GIT_REV_VALIDATION_CACHE = {}
+
+
+@dataclass
+class SourceGitContext:
+    old_path: str = ""
+    new_path: str = ""
+    repo: str = ""
+    path: str = ""
+    title: str = ""
+    context: str = ""
+    mode: str = ""
+    base: str = ""
+    target: str = ""
+    commit: str = ""
+
+    @classmethod
+    def from_env(cls):
+        return cls(
+            old_path=os.environ.get("SOURCEGIT_CUSTOM_DIFF_OLD") or "",
+            new_path=os.environ.get("SOURCEGIT_CUSTOM_DIFF_NEW") or "",
+            repo=os.environ.get("SOURCEGIT_CUSTOM_DIFF_REPO") or "",
+            path=os.environ.get("SOURCEGIT_CUSTOM_DIFF_PATH") or "",
+            title=os.environ.get("SOURCEGIT_CUSTOM_DIFF_TITLE") or "",
+            context=os.environ.get("SOURCEGIT_CUSTOM_DIFF_CONTEXT") or "",
+            mode=os.environ.get("SOURCEGIT_CUSTOM_DIFF_MODE") or "",
+            base=os.environ.get("SOURCEGIT_CUSTOM_DIFF_BASE") or "",
+            target=os.environ.get("SOURCEGIT_CUSTOM_DIFF_TARGET") or "",
+            commit=os.environ.get("SOURCEGIT_CUSTOM_DIFF_COMMIT") or "",
+        )
+
+    def apply_cli(self, values: dict):
+        for key, value in values.items():
+            if value is not None and hasattr(self, key):
+                setattr(self, key, value)
+
+    def repo_file_path(self) -> str:
+        if not self.repo or not self.path:
+            return ""
+        return os.path.abspath(os.path.join(self.repo, self.path.replace("/", os.sep)))
+
+    def revisions(self):
+        old_rev = (self.base or "").strip()
+        new_rev = (self.target or "").strip()
+        commit = (self.commit or "").strip()
+        if commit:
+            if not new_rev:
+                new_rev = commit
+            if not old_rev and (self.mode or "").lower() == "commit":
+                old_rev = f"{commit}~1"
+        return old_rev, new_rev
 
 # Fork 启动时 stdout 管道可能不被 drain，导致 print 阻塞。
 # SourceGit 的嵌入式 custom diff 会读取 stdout，因此保留管道并输出 HTML 路径。
@@ -53,6 +104,29 @@ def read_file(filepath: str) -> str:
             return f.read()
     except Exception:
         return ""
+
+
+def _git_object_path(repo_path: str) -> str:
+    return (repo_path or "").replace("\\", "/").lstrip("/")
+
+
+def _read_git_file(repo: str, rev: str, repo_path: str) -> str | None:
+    repo = os.path.abspath(repo) if repo else ""
+    object_path = _git_object_path(repo_path)
+    if not repo or not rev or not object_path or not _is_valid_git_rev(repo, rev):
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo, "cat-file", "blob", f"{rev}:{object_path}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.decode("utf-8", errors="replace")
 
 
 def is_prefab_or_scene(filepath: str) -> bool:
@@ -102,6 +176,8 @@ def _is_valid_git_rev(project_root: str, rev: str) -> bool:
 
 
 def _should_use_head_history_fallback(hint_path: str) -> bool:
+    if os.environ.get("PREFAB_DIFF_HEAD_HISTORY_FALLBACK") != "1":
+        return False
     normalized = (hint_path or "").replace("\\", "/").lower()
     if "/assets/" in normalized or normalized.endswith("/assets"):
         return False
@@ -136,6 +212,20 @@ def _normalize_project_root(path: str) -> str:
     if os.path.isdir(os.path.join(path, "Assets")):
         return path
     return ""
+
+
+def _project_root_from_repo_path(repo: str, repo_path: str) -> str:
+    if not repo or not repo_path:
+        return ""
+    abs_path = os.path.abspath(os.path.join(repo, repo_path.replace("/", os.sep)))
+    parts = abs_path.split(os.sep)
+    for idx, part in enumerate(parts):
+        if part.lower() != "assets":
+            continue
+        root = os.sep.join(parts[:idx])
+        if root and os.path.isdir(os.path.join(root, "Assets")):
+            return root
+    return _normalize_project_root(repo)
 
 
 def _looks_like_unity_project(path: str) -> bool:
@@ -460,8 +550,15 @@ def diff_prefab(old_nodes: OrderedDict, new_nodes: OrderedDict) -> dict:
 def _split_cli_args(argv):
     report_mode = REPORT_MODE_EMBED if _IS_SOURCEGIT_CUSTOM_DIFF else REPORT_MODE_FULL
     project_root = os.environ.get("PREFAB_DIFF_PROJECT_ROOT") or os.environ.get("UNITY_PROJECT_ROOT") or ""
+    sourcegit_context = SourceGitContext.from_env()
     files = []
     idx = 0
+
+    def read_value(arg_name: str, current_idx: int):
+        if "=" in arg_name:
+            return arg_name.split("=", 1)[1], current_idx
+        next_idx = current_idx + 1
+        return (argv[next_idx] if next_idx < len(argv) else ""), next_idx
 
     while idx < len(argv):
         arg = argv[idx]
@@ -471,18 +568,56 @@ def _split_cli_args(argv):
         elif lower in {"--embed", "--embedded", "--sourcegit", "--mode=embed", "--mode=embedded"}:
             report_mode = REPORT_MODE_EMBED
         elif lower.startswith("--mode="):
-            report_mode = _normalize_report_mode(arg.split("=", 1)[1])
+            mode_value = arg.split("=", 1)[1]
+            if mode_value.lower() in {"full", "embed", "embedded", "sourcegit"}:
+                report_mode = _normalize_report_mode(mode_value)
+            else:
+                sourcegit_context.mode = mode_value
         elif lower.startswith("--project-root=") or lower.startswith("--root=") or lower.startswith("--unity-project="):
             project_root = arg.split("=", 1)[1]
         elif lower in {"--project-root", "--root", "--unity-project"}:
             idx += 1
             if idx < len(argv):
                 project_root = argv[idx]
+        elif lower.startswith("--repo="):
+            sourcegit_context.repo = arg.split("=", 1)[1]
+        elif lower == "--repo":
+            sourcegit_context.repo, idx = read_value(arg, idx)
+        elif lower.startswith("--path="):
+            sourcegit_context.path = arg.split("=", 1)[1]
+        elif lower == "--path":
+            sourcegit_context.path, idx = read_value(arg, idx)
+        elif lower.startswith("--title="):
+            sourcegit_context.title = arg.split("=", 1)[1]
+        elif lower == "--title":
+            sourcegit_context.title, idx = read_value(arg, idx)
+        elif lower.startswith("--context="):
+            sourcegit_context.context = arg.split("=", 1)[1]
+        elif lower == "--context":
+            sourcegit_context.context, idx = read_value(arg, idx)
+        elif lower.startswith("--sourcegit-mode="):
+            sourcegit_context.mode = arg.split("=", 1)[1]
+        elif lower == "--sourcegit-mode":
+            sourcegit_context.mode, idx = read_value(arg, idx)
+        elif lower == "--mode":
+            sourcegit_context.mode, idx = read_value(arg, idx)
+        elif lower.startswith("--base="):
+            sourcegit_context.base = arg.split("=", 1)[1]
+        elif lower == "--base":
+            sourcegit_context.base, idx = read_value(arg, idx)
+        elif lower.startswith("--target="):
+            sourcegit_context.target = arg.split("=", 1)[1]
+        elif lower == "--target":
+            sourcegit_context.target, idx = read_value(arg, idx)
+        elif lower.startswith("--commit="):
+            sourcegit_context.commit = arg.split("=", 1)[1]
+        elif lower == "--commit":
+            sourcegit_context.commit, idx = read_value(arg, idx)
         else:
             files.append(arg)
         idx += 1
 
-    return report_mode, project_root, files
+    return report_mode, project_root, sourcegit_context, files
 
 
 def guess_filename(left_path: str, right_path: str) -> str:
@@ -518,14 +653,12 @@ def _sourcegit_temp_slot(path: str) -> str:
     return ""
 
 
-def _normalize_sourcegit_old_new_paths(left_path: str, right_path: str):
+def _normalize_sourcegit_old_new_paths(left_path: str, right_path: str, context: SourceGitContext):
     if not _IS_SOURCEGIT_CUSTOM_DIFF:
         return left_path, right_path
 
-    env_old = os.environ.get("SOURCEGIT_CUSTOM_DIFF_OLD") or ""
-    env_new = os.environ.get("SOURCEGIT_CUSTOM_DIFF_NEW") or ""
-    if env_old or env_new:
-        return env_old or left_path, env_new or right_path
+    if context.old_path or context.new_path:
+        return context.old_path or left_path, context.new_path or right_path
 
     left_slot = _sourcegit_temp_slot(left_path)
     right_slot = _sourcegit_temp_slot(right_path)
@@ -534,33 +667,55 @@ def _normalize_sourcegit_old_new_paths(left_path: str, right_path: str):
     return left_path, right_path
 
 
-def run_prefab_diff(left_path: str, right_path: str, report_mode: str = REPORT_MODE_FULL, project_root: str = ""):
+def run_prefab_diff(left_path: str, right_path: str, report_mode: str = REPORT_MODE_FULL,
+                    project_root: str = "", sourcegit_context: SourceGitContext | None = None):
     """主入口：对比两个 prefab 文件并生成 HTML"""
     report_mode = _normalize_report_mode(report_mode)
-    project_root = _normalize_project_root(project_root)
+    sourcegit_context = sourcegit_context or SourceGitContext.from_env()
+    project_root = _normalize_project_root(project_root) or _project_root_from_repo_path(
+        sourcegit_context.repo, sourcegit_context.path
+    )
     import logging
     log_path = os.path.join(tempfile.gettempdir(), "prefab_fork_diff_debug.log")
     logging.basicConfig(filename=log_path, level=logging.DEBUG, force=True,
                         format='%(asctime)s %(message)s')
     logging.debug(f"run_prefab_diff called: left={left_path}, right={right_path}, report_mode={report_mode}, project_root={project_root}")
+    logging.debug(
+        "sourcegit context: "
+        f"repo={sourcegit_context.repo}, path={sourcegit_context.path}, "
+        f"mode={sourcegit_context.mode}, base={sourcegit_context.base}, "
+        f"target={sourcegit_context.target}, commit={sourcegit_context.commit}"
+    )
     logging.debug(f"cwd={os.getcwd()}")
 
     original_left_path, original_right_path = left_path, right_path
-    left_path, right_path = _normalize_sourcegit_old_new_paths(left_path, right_path)
+    left_path, right_path = _normalize_sourcegit_old_new_paths(left_path, right_path, sourcegit_context)
     if (left_path, right_path) != (original_left_path, original_right_path):
         logging.debug(f"normalized old/new paths: old={left_path}, new={right_path}")
 
     # 优先使用真实 Assets 路径；Fork 双临时文件对比时退回配置根目录。
-    hint_path = next((p for p in [right_path, left_path] if "Assets" in p.replace("\\", "/")), "")
+    hint_path = sourcegit_context.repo_file_path()
+    if not hint_path:
+        hint_path = next((p for p in [right_path, left_path] if "Assets" in p.replace("\\", "/")), "")
     if not hint_path:
         hint_path = right_path or left_path
     logging.debug(f"hint_path={hint_path}")
 
-    old_content = read_file(left_path)
-    new_content = read_file(right_path)
-    old_rev = _infer_git_rev_from_temp_path(left_path)
-    new_rev = _infer_git_rev_from_temp_path(right_path)
+    context_old_rev, context_new_rev = sourcegit_context.revisions()
+    old_rev = context_old_rev or ("" if _IS_SOURCEGIT_CUSTOM_DIFF else _infer_git_rev_from_temp_path(left_path))
+    new_rev = context_new_rev or ("" if _IS_SOURCEGIT_CUSTOM_DIFF else _infer_git_rev_from_temp_path(right_path))
     logging.debug(f"old_rev={old_rev}, new_rev={new_rev}")
+
+    old_content = _read_git_file(sourcegit_context.repo, old_rev, sourcegit_context.path)
+    old_source = "git" if old_content is not None else "temp"
+    if old_content is None:
+        old_content = read_file(left_path)
+
+    new_content = _read_git_file(sourcegit_context.repo, new_rev, sourcegit_context.path)
+    new_source = "git" if new_content is not None else "temp"
+    if new_content is None:
+        new_content = read_file(right_path)
+    logging.debug(f"content source: old={old_source}, new={new_source}")
 
     logging.debug(f"old_content length={len(old_content)}, new_content length={len(new_content)}")
 
@@ -589,10 +744,13 @@ def run_prefab_diff(left_path: str, right_path: str, report_mode: str = REPORT_M
     logging.debug(f"added={len(diff_result['added_nodes'])}, removed={len(diff_result['removed_nodes'])}, modified={len(diff_result['modified_nodes'])}")
 
     # 生成 HTML（传入完整节点数据用于 Hierarchy 树构建）
-    filename = guess_filename(left_path, right_path)
+    filename = guess_filename(sourcegit_context.path or sourcegit_context.title or left_path, right_path)
     html_content = generate_prefab_html(filename, diff_result, old_nodes, new_nodes, report_mode)
 
-    output_path = os.path.join(tempfile.gettempdir(), f"prefab_diff_{report_mode}_{os.getpid()}.html")
+    output_dir = os.environ.get("SOURCEGIT_CUSTOM_DIFF_TEMP") if _IS_SOURCEGIT_CUSTOM_DIFF else ""
+    if not output_dir or not os.path.isdir(output_dir):
+        output_dir = tempfile.gettempdir()
+    output_path = os.path.join(output_dir, f"prefab_diff_{report_mode}_{os.getpid()}.html")
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_content)
 
@@ -611,10 +769,10 @@ def run_prefab_diff(left_path: str, right_path: str, report_mode: str = REPORT_M
 
 
 if __name__ == "__main__":
-    _report_mode, _project_root, _files = _split_cli_args(sys.argv[1:])
+    _report_mode, _project_root, _sourcegit_context, _files = _split_cli_args(sys.argv[1:])
     if len(_files) < 2:
-        print("用法: prefab_fork_diff.py [--full|--embed|--mode=embed] [--project-root <UnityProject>] <old_file> <new_file>")
+        print("用法: prefab_fork_diff.py [--full|--embed|--sourcegit] [--project-root <UnityProject>] [--repo <Repo>] [--path <RepoPath>] [--base <Rev>] [--target <Rev>] <old_file> <new_file>")
         sys.exit(1)
-    _output_path = run_prefab_diff(_files[0], _files[1], _report_mode, _project_root)
+    _output_path = run_prefab_diff(_files[0], _files[1], _report_mode, _project_root, _sourcegit_context)
     if _IS_SOURCEGIT_CUSTOM_DIFF and _output_path:
         print(_output_path, flush=True)
